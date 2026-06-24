@@ -6,13 +6,15 @@
 /// - StopNow() -> oprește COADA + request + audio (prin AzureTTS.StopNow)
 /// - IsSpeaking() -> folosește AzureTTS.IsSpeaking (include request în zbor)
 /// </summary>
+[DisallowMultipleComponent]
 public class AzureTTSInterruptible : MonoBehaviour
 {
     public AzureTTS tts;
 
     private void Awake()
     {
-        if (tts == null) tts = FindObjectOfType<AzureTTS>(true);
+        if (tts == null)
+            tts = FindObjectOfType<AzureTTS>(true);
     }
 
     public void Speak(string text)

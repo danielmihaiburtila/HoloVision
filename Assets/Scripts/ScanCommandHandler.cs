@@ -11,18 +11,21 @@ public class ScanCommandHandler : MonoBehaviour
     [Header("Always-on safety")]
     public bool startInPassiveMode = true;
 
+    private bool detectorAvailable = false;
+
     private void Awake()
     {
         if (tts == null) tts = FindObjectOfType<AzureTTS>(true);
         if (detector == null) detector = FindObjectOfType<ObstacleDetectorMR>(true);
 
-        if (detector == null)
+        detectorAvailable = detector != null;
+
+        if (!detectorAvailable)
         {
-            Debug.LogError("[ScanHandler] ObstacleDetectorMR not found in scene!");
+            Debug.LogWarning("[ScanHandler] ObstacleDetectorMR not found in scene. Safety obstacle mode will be skipped.");
             return;
         }
 
-        // IMPORTANT:
         // Detector stays enabled always. We only switch mode.
         detector.enabled = true;
 
@@ -37,11 +40,14 @@ public class ScanCommandHandler : MonoBehaviour
     /// </summary>
     public void StartSafetyActive()
     {
-        if (detector == null) return;
+        if (!detectorAvailable || detector == null)
+        {
+            Debug.Log("[ScanHandler] StartSafetyActive skipped: no ObstacleDetectorMR in scene.");
+            return;
+        }
 
         detector.SetMode(ObstacleDetectorMR.Mode.Active);
 
-        // Text scurt, să nu devină enervant
         if (tts != null) tts.Speak("Siguranță activă.");
         Debug.Log("[ScanHandler] Mode = ACTIVE");
     }
@@ -51,7 +57,11 @@ public class ScanCommandHandler : MonoBehaviour
     /// </summary>
     public void StopSafetyActive()
     {
-        if (detector == null) return;
+        if (!detectorAvailable || detector == null)
+        {
+            Debug.Log("[ScanHandler] StopSafetyActive skipped: no ObstacleDetectorMR in scene.");
+            return;
+        }
 
         detector.SetMode(ObstacleDetectorMR.Mode.Passive);
 
@@ -84,6 +94,7 @@ public class ScanCommandHandler : MonoBehaviour
     private static string Normalize(string input)
     {
         if (string.IsNullOrWhiteSpace(input)) return "";
+
         input = input.ToLowerInvariant().Trim();
 
         string normalized = input.Normalize(NormalizationForm.FormD);

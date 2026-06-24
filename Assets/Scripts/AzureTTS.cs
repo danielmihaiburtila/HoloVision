@@ -5,6 +5,7 @@ using System.Text;
 using UnityEngine;
 using UnityEngine.Networking;
 
+[DisallowMultipleComponent]
 public class AzureTTS : MonoBehaviour
 {
     [Header("Azure Configuration")]
@@ -16,7 +17,7 @@ public class AzureTTS : MonoBehaviour
     public AudioSource audioSource;
 
     [Header("Behavior")]
-    [Tooltip("Recomandat TRUE pentru OCR: Speak() pune text la coadă, nu întrerupe frazele.")]
+    [Tooltip("TRUE recomandat pentru OCR: Speak() pune text la coadă, nu întrerupe frazele.")]
     public bool queueMode = true;
 
     [Tooltip("Timeout request TTS (secunde).")]
@@ -90,27 +91,28 @@ public class AzureTTS : MonoBehaviour
     /// </summary>
     public void StopNow()
     {
-        // Clear queue
+        
         speakQueue.Clear();
 
-        // Abort request în zbor
+       
         try
         {
-            if (activeRequest != null) activeRequest.Abort();
+            if (activeRequest != null)
+                activeRequest.Abort();
         }
         catch { /* ignore */ }
 
         activeRequest = null;
         requestInFlight = false;
 
-        // Stop audio
+        
         if (audioSource != null)
         {
             audioSource.Stop();
             audioSource.clip = null;
         }
 
-        // Stop runner
+        
         if (runner != null)
         {
             StopCoroutine(runner);
@@ -136,6 +138,7 @@ public class AzureTTS : MonoBehaviour
     private IEnumerator SynthesizeAndPlay(string text)
     {
         if (string.IsNullOrWhiteSpace(text)) yield break;
+        if (string.IsNullOrEmpty(synthesisEndpoint)) yield break;
 
         // SSML
         string ssml =
@@ -170,8 +173,11 @@ public class AzureTTS : MonoBehaviour
                 yield break;
             }
 
-            AudioClip clip = null;
-            try { clip = DownloadHandlerAudioClip.GetContent(request); }
+            AudioClip clip;
+            try
+            {
+                clip = DownloadHandlerAudioClip.GetContent(request);
+            }
             catch (Exception e)
             {
                 Debug.LogError("[AzureTTS] GetContent exception: " + e.Message);

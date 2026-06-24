@@ -1,6 +1,9 @@
-# =========================
-# Unity generated folders
-# =========================
+############################
+
+# UNITY - FOLDERE GENERATE
+
+############################
+
 [Ll]ibrary/
 [Tt]emp/
 [Oo]bj/
@@ -9,16 +12,34 @@
 [Ll]ogs/
 [Uu]ser[Ss]ettings/
 [Mm]emoryCaptures/
+[Rr]ecordings/
 
-# =========================
-# Visual Studio / Rider
-# =========================
+############################
+
+# UNITY - CACHE / TESTE
+
+############################
+
+[Ee]xported[Oo]bj/
+.consulo/
+.gradle/
 .vs/
 .idea/
+.vscode/
+
+############################
+
+# VISUAL STUDIO / IDE
+
+############################
+
 *.csproj
-*.sln
-*.user
 *.unityproj
+*.sln
+*.suo
+*.tmp
+*.user
+*.userprefs
 *.pidb
 *.booproj
 *.svd
@@ -26,31 +47,136 @@
 *.mdb
 *.opendb
 *.VC.db
+*.VC.VC.opendb
+*.code-workspace
 
-# =========================
-# OS junk files
-# =========================
+############################
+
+# HOLOVISION - SECRETE LOCALE
+
+############################
+
+# Asset-ul local care conține cheile Azure și Google
+
+/Assets/Resources/SecretsConfig.asset
+/Assets/Resources/SecretsConfig.asset.meta
+
+# Copii de siguranță ale asset-ului cu secrete
+
+/Assets/Resources/SecretsConfig.asset.bak
+/Assets/Resources/SecretsConfig.asset.backup
+/Assets/Resources/SecretsConfig.asset.old
+/Assets/Resources/SecretsConfig.asset.tmp
+
+# Fișiere locale pentru variabile de mediu
+
+.env
+.env.*
+!.env.example
+
+# Alte fișiere care pot conține secrete
+
+secrets.json
+secrets.properties
+credentials.json
+serviceAccountKey.json
+service-account*.json
+firebase-adminsdk*.json
+
+############################
+
+# CHEI ȘI CERTIFICATE PRIVATE
+
+############################
+
+*.pfx
+*.p12
+*.snk
+*.jks
+*.keystore
+keystore.properties
+
+############################
+
+# BUILD ȘI PACHETE UWP
+
+############################
+
+/AppPackages/
+[Aa]pp[Pp]ackages/
+
+*.appx
+*.appxbundle
+*.appxupload
+*.msix
+*.msixbundle
+*.msixupload
+
+############################
+
+# BUILD ANDROID
+
+############################
+
+*.apk
+*.aab
+
+############################
+
+# ALTE BUILD-URI GENERATE
+
+############################
+
+*.exe
+*.unitypackage
+
+############################
+
+# CRASH REPORTS ȘI LOGURI
+
+############################
+
+sysinfo.txt
+crashlytics-build.properties
+*.log
+*.stacktrace
+
+############################
+
+# FIȘIERE SISTEM DE OPERARE
+
+############################
+
 .DS_Store
-Thumbs.db
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
 ehthumbs.db
+Thumbs.db
 Desktop.ini
 
-# =========================
-# Addressables cache
-# =========================
-[Aa]ssets/[Aa]ddressable[Aa]ssets[Dd]ata/*/*.bin*
+############################
 
-# =========================
-# UWP / HoloLens build outputs
-# (common folders created when building UWP in Unity/VS)
-# =========================
-AppPackages/
-ExportedObj/
-GeneratedProjects/
-Il2CppOutputProject/
-.vscode/
+# BACKUP-URI TEMPORARE
 
-# =========================
-# Optional: Unity Collab / Version Control
-# =========================
-*.unitypackage
+############################
+
+*~
+*.bak
+*.orig
+*.rej
+
+############################
+# META PENTRU CERTIFICATE
+############################
+
+*.pfx.meta
+*.p12.meta
+*.snk.meta
+
+############################
+# BACKUP-URI
+############################
+
+*.backup

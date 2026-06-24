@@ -13,11 +13,14 @@ public class AzureReadOCR : MonoBehaviour
     public string apiVersion = "2024-02-01";
     public string language = "en";
 
+
+
     [Header("Dependencies")]
     public PhotoCaptureManager captureManager;
     public AzureTTSInterruptible tts;
     public SpeechUIAnimator uiAnimator;
     public AzureOpenAISummarizer summarizer;
+    public VoiceCommandRouter router;
 
     [Header("Behavior")]
     public int timeoutSeconds = 25;
@@ -58,6 +61,7 @@ public class AzureReadOCR : MonoBehaviour
         if (tts == null) tts = FindObjectOfType<AzureTTSInterruptible>(true);
         if (uiAnimator == null) uiAnimator = FindObjectOfType<SpeechUIAnimator>(true);
         if (summarizer == null) summarizer = FindObjectOfType<AzureOpenAISummarizer>(true);
+        if (router == null) router = FindObjectOfType<VoiceCommandRouter>(true);
     }
 
     private void Start()
@@ -70,12 +74,13 @@ public class AzureReadOCR : MonoBehaviour
     {
         if (string.IsNullOrWhiteSpace(endpoint)) return;
 
-        analyzeUrl =
-            $"{endpoint.TrimEnd('/')}/computervision/imageanalysis:analyze" +
-            $"?api-version={apiVersion}" +
-            $"&features=read" +
-            $"&overload=stream" +
-            $"&language={language}";
+        analyzeUrl = $"{endpoint.TrimEnd('/')}/computervision/imageanalysis:analyze"
+                   + $"?api-version={apiVersion}"
+                   + $"&features=read"
+                   + $"&overload=stream";
+
+        if (!string.IsNullOrWhiteSpace(language))
+            analyzeUrl += $"&language={language}";
     }
 
     /// <summary>
@@ -83,17 +88,13 @@ public class AzureReadOCR : MonoBehaviour
     /// </summary>
     public void StopReading()
     {
-        // oprește orice corutină care rulează pe acest AzureReadOCR (inclusiv SpeakSmart)
         StopAllCoroutines();
 
-        // invalidează orice sesiune curentă
         speakToken++;
         busy = false;
 
-        // oprește sumarizarea (abort request)
         summarizer?.CancelSummarization();
 
-        // oprește TTS imediat (request + audio)
         if (tts != null) tts.StopNow();
 
         if (uiAnimator != null) uiAnimator.ShowUI("Am oprit citirea.");
@@ -104,38 +105,39 @@ public class AzureReadOCR : MonoBehaviour
     {
         if (busy)
         {
-            Feedback("Citesc deja. Spune GATA ca să opresc.", processing: true);
+            Feedback("Citesc deja.", processing: true);
             return;
         }
 
         if (captureManager == null)
         {
             Feedback("Eroare: CameraManager nu este legat.", error: true);
+            router?.menuUI?.ShowFeaturesMenu();
             return;
         }
 
         if (string.IsNullOrWhiteSpace(subscriptionKey) || subscriptionKey.Contains("PUT_"))
         {
             Feedback("Eroare: cheia de Azure Vision nu este setată.", error: true);
+            router?.menuUI?.ShowFeaturesMenu();
             return;
         }
 
         if (string.IsNullOrWhiteSpace(endpoint) || !endpoint.StartsWith("http", StringComparison.OrdinalIgnoreCase))
         {
             Feedback("Eroare: endpoint-ul Azure Vision nu este setat corect.", error: true);
+            router?.menuUI?.ShowFeaturesMenu();
             return;
         }
 
         BuildAnalyzeUrl();
-
-        // IMPORTANT: înainte să pornim o citire nouă, oprim orice “resturi”
         StopReading();
 
-        // acum pornim sesiunea nouă
+
         busy = true;
         int myToken = speakToken;
 
-        Feedback("Citesc textul. Umple cadrul cu text și ține stabil o secundă.", processing: true);
+        Feedback("Citesc textul. Dacă textul este prea lung, îți voi citi mai întâi un rezumat, apoi textul complet. Poți opri oricând prin gestul cu palma întinsă orientată în față.", processing: true);
 
         captureManager.TakeBestPhotoForOCR(bytes =>
         {
@@ -145,11 +147,109 @@ public class AzureReadOCR : MonoBehaviour
             {
                 busy = false;
                 Feedback("Eroare: nu am primit o imagine validă.", error: true);
+                router?.menuUI?.ShowFeaturesMenu();
                 return;
             }
 
             activeAnalyze = StartCoroutine(AnalyzeRead(bytes, myToken));
         });
+    }
+
+    public void AnalyzeBytesForProduct(byte[] imageBytes, Action<string> onDone)
+    {
+        if (busy)
+        {
+            onDone?.Invoke(null);
+            return;
+        }
+
+        if (imageBytes == null || imageBytes.Length < 2000)
+        {
+            onDone?.Invoke(null);
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(subscriptionKey) || subscriptionKey.Contains("PUT_"))
+        {
+            Debug.LogError("[AzureReadOCR] Vision key invalid.");
+            onDone?.Invoke(null);
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(endpoint) || !endpoint.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+        {
+            Debug.LogError("[AzureReadOCR] Vision endpoint invalid.");
+            onDone?.Invoke(null);
+            return;
+        }
+
+        BuildAnalyzeUrl();
+        StartCoroutine(AnalyzeBytesForProductRoutine(imageBytes, onDone));
+    }
+    private IEnumerator AnalyzeBytesForProductRoutine(byte[] imageBytes, Action<string> onDone)
+    {
+        busy = true;
+
+        using (UnityWebRequest req = new UnityWebRequest(analyzeUrl, "POST"))
+        {
+            req.uploadHandler = new UploadHandlerRaw(imageBytes);
+            req.downloadHandler = new DownloadHandlerBuffer();
+            req.timeout = timeoutSeconds;
+
+            req.SetRequestHeader("Content-Type", "application/octet-stream");
+            req.SetRequestHeader("Ocp-Apim-Subscription-Key", subscriptionKey);
+
+            yield return req.SendWebRequest();
+
+            busy = false;
+
+            string body = req.downloadHandler != null ? req.downloadHandler.text : "";
+
+            if (req.result != UnityWebRequest.Result.Success)
+            {
+                Debug.LogError($"[AzureReadOCR] Product OCR FAIL code={req.responseCode} err={req.error} body={body}");
+                onDone?.Invoke(null);
+                yield break;
+            }
+
+            if (logResponses) Debug.Log("[AzureReadOCR] Product OCR JSON: " + body);
+
+            if (!TryParseRead(body, out string rawText, out float rejectedRatio))
+            {
+                onDone?.Invoke(null);
+                yield break;
+            }
+
+            if (rejectedRatio > maxRejectedRatio)
+            {
+                onDone?.Invoke(null);
+                yield break;
+            }
+
+            string clean = CleanupTextKeepLines(rawText);
+            onDone?.Invoke(clean);
+        }
+    }
+    private static string CleanupTextKeepLines(string input)
+    {
+        if (string.IsNullOrWhiteSpace(input)) return input;
+
+        input = input.Replace("\r", "\n").Replace("\t", " ");
+
+        string[] lines = input.Split(new[] { '\n' }, StringSplitOptions.None);
+        StringBuilder sb = new StringBuilder();
+
+        foreach (var lineRaw in lines)
+        {
+            string line = lineRaw;
+            while (line.Contains("  ")) line = line.Replace("  ", " ");
+            line = line.Trim();
+
+            if (line.Length == 0) continue;
+            sb.AppendLine(line);
+        }
+
+        return sb.ToString().Trim();
     }
 
     private IEnumerator AnalyzeRead(byte[] imageBytes, int myToken)
@@ -171,6 +271,7 @@ public class AzureReadOCR : MonoBehaviour
             activeAnalyze = null;
 
             string body = req.downloadHandler != null ? req.downloadHandler.text : "";
+
             if (req.result != UnityWebRequest.Result.Success)
             {
                 Debug.LogError($"[AzureReadOCR] FAIL code={req.responseCode} err={req.error} body={body}");
@@ -182,25 +283,28 @@ public class AzureReadOCR : MonoBehaviour
 
             if (!TryParseRead(body, out string rawText, out float rejectedRatio))
             {
-                Feedback("Nu am găsit text clar. Apropie foaia și ține-o nemișcată.", error: true);
+                Feedback("Nu am găsit text clar", error: true);
                 yield break;
             }
 
             if (rejectedRatio > maxRejectedRatio)
             {
-                Feedback("Text neclar. Ține foaia mai stabilă și umple cadrul cu text.", error: true);
+                Feedback("Text neclar.", error: true);
                 yield break;
             }
 
             string cleanText = CleanupText(rawText);
             string speechText = ReflowForSpeech(cleanText);
-
+            router?.ShowTextResult(cleanText);
             if (myToken != speakToken) yield break;
 
-            // 1) Rezumat pentru texte lungi
+            // 1) Text lung: rezumat + citire completă automată
             if (enableSummarization && summarizer != null && speechText.Length >= summarizeIfCharsOver)
             {
-                Feedback("Text lung detectat. Încerc un rezumat. Spune GATA ca să opresc.", processing: true);
+                Feedback(
+                    "Am detectat un text lung. Îți voi citi mai întâi un rezumat, apoi voi continua automat cu textul complet. Poți opri oricând citirea prin gestul cu palma întinsă orientată în față",
+                    processing: true
+                );
 
                 string summary = null;
                 yield return StartCoroutine(summarizer.SummarizeForBlindRo(speechText, s => summary = s));
@@ -209,32 +313,54 @@ public class AzureReadOCR : MonoBehaviour
 
                 if (!string.IsNullOrWhiteSpace(summary))
                 {
-                    activeSpeak = StartCoroutine(SpeakSmart(summary, myToken));
+                    string introSummary = "Rezumatul textului este următorul.";
+                    activeSpeak = StartCoroutine(SpeakSmart(introSummary + " " + summary, myToken));
                     yield return activeSpeak;
                     activeSpeak = null;
 
                     if (myToken != speakToken) yield break;
 
-                    if (askToReadFullAfterSummary)
-                        Feedback("Dacă vrei să îți citesc tot textul, spune: CITEȘTE TOT.", success: true);
+                    Feedback(
+                        "Acum voi începe citirea textului complet.",
+                        processing: true
+                    );
 
+                    if (myToken != speakToken) yield break;
+
+                    activeSpeak = StartCoroutine(SpeakSmart(speechText, myToken));
+                    yield return activeSpeak;
+                    activeSpeak = null;
+
+                    if (myToken != speakToken) yield break;
+
+                    Feedback("Am terminat citirea textului.", success: true);
                     yield break;
                 }
 
-                // fallback: citire normală
-                Feedback("Nu am reușit rezumatul. Îl citesc pe bucăți. Spune GATA ca să opresc.", error: true);
+                // fallback dacă rezumatul eșuează
+                Feedback(
+                    "Nu am reușit să fac rezumatul. Voi citi textul complet pe bucăți. Poți opri oricând prin gestul cu palma întinsă.",
+                    error: true
+                );
             }
 
-            // 2) Citire completă
+            // 2) Text scurt sau fallback: citire completă
+            Feedback("Am detectat textul. Îl citesc acum.", processing: true);
+
             activeSpeak = StartCoroutine(SpeakSmart(speechText, myToken));
             yield return activeSpeak;
             activeSpeak = null;
+
+            if (myToken != speakToken) yield break;
+
+            Feedback("Am terminat citirea textului.", success: true);
         }
     }
 
     // =========================
     // Speaking (natural + stop)
     // =========================
+
     private IEnumerator SpeakSmart(string text, int myToken)
     {
         if (string.IsNullOrWhiteSpace(text)) yield break;
@@ -246,19 +372,20 @@ public class AzureReadOCR : MonoBehaviour
 
             string speak = chunk.Trim();
 
-            // Intonație: dacă nu se termină cu . ! ? -> adaugă virgulă (nu “final de propoziție”)
-            if (!EndsWithTerminalPunctuation(speak))
-                speak += ",";
+            // Intonație: dacă nu se termină cu . ! ? -> adaugă virgulă
+            if (!EndsWithTerminalPunctuation(speak)) speak += ",";
 
             tts?.Speak(speak);
 
             // Așteaptă până termină (dar iese imediat la STOP)
             float t = 0f;
-            float hardMax = Mathf.Clamp(speak.Length / 10f, 2f, 25f); // suficient pt request+play
+            float hardMax = Mathf.Clamp(speak.Length / 10f, 2f, 25f);
+
             while (t < hardMax)
             {
                 if (myToken != speakToken) yield break;
                 if (tts != null && !tts.IsSpeaking()) break;
+
                 t += Time.deltaTime;
                 yield return null;
             }
@@ -275,6 +402,7 @@ public class AzureReadOCR : MonoBehaviour
     // =========================
     // OCR Parse
     // =========================
+
     private bool TryParseRead(string json, out string text, out float rejectedRatio)
     {
         text = null;
@@ -283,11 +411,11 @@ public class AzureReadOCR : MonoBehaviour
         try
         {
             var root = JsonUtility.FromJson<Root>(json);
-            if (root?.readResult?.blocks == null || root.readResult.blocks.Length == 0)
-                return false;
+            if (root?.readResult?.blocks == null || root.readResult.blocks.Length == 0) return false;
 
             int kept = 0;
             int rejected = 0;
+
             StringBuilder sb = new StringBuilder();
 
             foreach (var b in root.readResult.blocks)
@@ -343,19 +471,19 @@ public class AzureReadOCR : MonoBehaviour
     // =========================
     // Text formatting
     // =========================
+
     private static string CleanupText(string input)
     {
         if (string.IsNullOrWhiteSpace(input)) return input;
+
         input = input.Replace("\r", "\n").Replace("\t", " ");
+
         while (input.Contains("  ")) input = input.Replace("  ", " ");
         while (input.Contains("\n\n\n")) input = input.Replace("\n\n\n", "\n\n");
+
         return input.Trim();
     }
 
-    /// <summary>
-    /// Unește liniile OCR în propoziții mai naturale.
-    /// Păstrează paragrafele (linie goală => paragraf nou).
-    /// </summary>
     private static string ReflowForSpeech(string input)
     {
         if (string.IsNullOrWhiteSpace(input)) return input;
@@ -368,6 +496,7 @@ public class AzureReadOCR : MonoBehaviour
         for (int p = 0; p < paragraphs.Length; p++)
         {
             var lines = paragraphs[p].Split(new[] { "\n" }, StringSplitOptions.RemoveEmptyEntries);
+
             StringBuilder sb = new StringBuilder();
 
             for (int i = 0; i < lines.Length; i++)
@@ -383,9 +512,6 @@ public class AzureReadOCR : MonoBehaviour
                 }
 
                 sb.Append(line);
-
-                // dacă linia se termină cu punctuație terminală, păstrează pauza
-                // altfel pune spațiu (nu “final de propoziție”)
                 sb.Append(" ");
             }
 
@@ -395,12 +521,6 @@ public class AzureReadOCR : MonoBehaviour
         return string.Join("\n\n", paragraphs).Trim();
     }
 
-    /// <summary>
-    /// Split natural:
-    /// 1) pe propoziții reale: . ! ?
-    /// 2) dacă e prea lung, split soft pe virgulă
-    /// 3) dacă e încă prea lung, split pe spații (hard)
-    /// </summary>
     private static IEnumerable<string> SplitForSpeechNatural(string text, int maxChars)
     {
         var paragraphs = text.Split(new[] { "\n\n" }, StringSplitOptions.RemoveEmptyEntries);
@@ -410,7 +530,7 @@ public class AzureReadOCR : MonoBehaviour
             string para = paraRaw.Trim();
             if (para.Length == 0) continue;
 
-            var sentences = SplitBySentenceEnd(para); // doar .!? sunt “sentence end”
+            var sentences = SplitBySentenceEnd(para);
 
             foreach (var s in sentences)
             {
@@ -425,15 +545,13 @@ public class AzureReadOCR : MonoBehaviour
 
                 // split soft pe virgulă
                 var parts = SplitByDelimiter(sent, ',');
+
                 foreach (var partRaw in parts)
                 {
                     string part = partRaw.Trim();
                     if (part.Length == 0) continue;
 
-                    if (part.Length <= maxChars)
-                    {
-                        yield return part;
-                    }
+                    if (part.Length <= maxChars) yield return part;
                     else
                     {
                         foreach (var hard in HardSplitBySpaces(part, maxChars))
@@ -501,6 +619,7 @@ public class AzureReadOCR : MonoBehaviour
     private static IEnumerable<string> HardSplitBySpaces(string input, int maxChars)
     {
         int i = 0;
+
         while (i < input.Length)
         {
             int len = Mathf.Min(maxChars, input.Length - i);
@@ -526,7 +645,6 @@ public class AzureReadOCR : MonoBehaviour
             else uiAnimator.ShowUI(message);
         }
 
-        // IMPORTANT: feedback-ul trebuie să fie interruptible
         tts?.Speak(message);
     }
 }

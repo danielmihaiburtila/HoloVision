@@ -143,6 +143,23 @@ public class ObjectFinderSystem : MonoBehaviour
     public float debugUiInterval = 1.2f;
     public bool logJson = false;
     public bool logMatches = false;
+    [Header("Search voice feedback")]
+    [Tooltip("Dacă nu găsește imediat obiectul, spune periodic utilizatorului ce să facă.")]
+    public bool speakSearchProgress = true;
+
+    [Tooltip("Cooldown pentru mesajele vocale în timpul căutării.")]
+    public float searchProgressSpeakCooldown = 4.5f;
+
+    [Tooltip("Dacă serviciul Vision dă eroare, spune vocal problema, nu doar în Console.")]
+    public bool speakVisionErrors = true;
+
+    [Tooltip("Cooldown pentru erori Vision, ca să nu repete obsesiv.")]
+    public float visionErrorSpeakCooldown = 6.0f;
+
+    private float lastSearchProgressSpeakTime = -999f;
+    private float lastVisionErrorSpeakTime = -999f;
+    private int consecutiveCaptureFails = 0;
+    private int consecutiveVisionFails = 0;
 
     // =========================
     // Internal
@@ -150,7 +167,7 @@ public class ObjectFinderSystem : MonoBehaviour
     private bool running;
     private bool requestInFlight;
 
-    private string targetKey;                 // normalized RO
+    private string targetKey;                 // normalized RO (canonical)
     private string targetRaw;                 // as spoken
     private string[] wantedLabelsEn;          // what we match in Vision results
 
@@ -175,11 +192,26 @@ public class ObjectFinderSystem : MonoBehaviour
     private float lastSeenTime = -999f;
     private float lastLostAnnounceTime = -999f;
     private float lastCloseAnnounceTime = -999f;
+    private bool lostAnnouncedForCurrentLoss = false;
+    private bool searchProgressSpokenOnce = false;
+
+    private float lastDirectionSpeakTime = -999f;
+    private Side lastSpokenDirection = Side.Center;
+
+    [Header("Direction voice guidance")]
+    public bool speakDirectionGuidance = true;
+    public float directionSpeakCooldown = 3.0f;
 
     private enum Side { Left, Center, Right }
 
     private string analyzeUrl;   // Azure
     private string googleUrl;    // Google
+
+    [Header("Interaction instructions")]
+    public bool preferPhoneControlInstructions = false;
+
+
+    public bool IsRunning => running;
 
     // =========================
     // AZURE response models
@@ -189,16 +221,53 @@ public class ObjectFinderSystem : MonoBehaviour
     [Serializable] private class AzureRectangle { public int x; public int y; public int w; public int h; }
     [Serializable] private class AzureVisionTag { public string name; public float confidence; }
 
+    [Header("Free seat / free table secondary verification")]
+    [Tooltip("Număr de cadre pentru confirmarea libertății.")]
+    public int occupancyCheckFrames = 3;
+
+    [Tooltip("Câte cadre din cele de mai sus trebuie să spună 'liber' ca să confirmăm.")]
+    public int occupancyFreeVotesNeeded = 2;
+
+    [Tooltip("Câte secunde ignorăm temporar un scaun / o masă respinsă ca ocupată.")]
+    public float rejectedTargetMemorySeconds = 4f;
+
+    [Tooltip("Overlap minim pe țintă pentru a considera că e ocupată.")]
+    [Range(0.05f, 0.80f)] public float chairOccupiedOverlapThreshold = 0.18f;
+
+    [Range(0.05f, 0.80f)] public float tableOccupiedOverlapThreshold = 0.12f;
+
+
+    private enum OccupancyMode
+    {
+        None,
+        ChairFree,
+        TableFree
+    }
+
+    private OccupancyMode occupancyMode = OccupancyMode.None;
+    private Queue<bool> occupancyVotes = new Queue<bool>();
+    private bool occupancyIntroSpoken = false;
+    private bool occupancyResolved = false;
+    private Rect currentCandidateRect01;
+
+    private class RejectedTargetMemory
+    {
+        public Rect rect;
+        public float until;
+    }
+
+    private readonly List<RejectedTargetMemory> rejectedTargets = new List<RejectedTargetMemory>();
+
     // =========================
     // GOOGLE response models
     // =========================
     [Serializable] private class GoogleAnnotateRoot { public GoogleResponse[] responses; }
-
     [Serializable]
     private class GoogleResponse
     {
         public GoogleLocalizedObjectAnnotation[] localizedObjectAnnotations;
         public GoogleLabelAnnotation[] labelAnnotations;
+        public GoogleTextAnnotation[] textAnnotations;
         public GoogleError error;
     }
 
@@ -216,6 +285,7 @@ public class ObjectFinderSystem : MonoBehaviour
     private class GoogleBoundingPoly
     {
         public GoogleNormalizedVertex[] normalizedVertices;
+        public GoogleVertex[] vertices;
     }
 
     [Serializable]
@@ -232,6 +302,7 @@ public class ObjectFinderSystem : MonoBehaviour
         public float score;
     }
 
+
     private void Awake()
     {
         if (captureManager == null) captureManager = FindObjectOfType<PhotoCaptureManager>(true);
@@ -241,6 +312,7 @@ public class ObjectFinderSystem : MonoBehaviour
 
         if (headCamera == null && Camera.main != null) headCamera = Camera.main.transform;
 
+        TryLoadSecretsConfigIfNeeded();
         BuildUrls();
 
         if (enableBeep)
@@ -275,6 +347,16 @@ public class ObjectFinderSystem : MonoBehaviour
         // Google
         googleUrl = $"https://vision.googleapis.com/v1/images:annotate?key={googleApiKey}";
     }
+    public void RebuildUrlsAfterSecretsInjected()
+    {
+        BuildUrls();
+
+        Debug.Log(
+            "[ObjectFinder] URLs rebuilt after secrets. " +
+            "AzureConfigured=" + IsAzureConfigured() +
+            ", GoogleKeySet=" + !string.IsNullOrWhiteSpace(googleApiKey)
+        );
+    }
 
     private bool IsAzureConfigured()
     {
@@ -295,9 +377,10 @@ public class ObjectFinderSystem : MonoBehaviour
             return;
         }
 
+        TryLoadSecretsConfigIfNeeded();
         BuildUrls();
 
-        // Provider config checks
+      
         if (provider == Provider.AzureVision)
         {
             if (!IsAzureConfigured())
@@ -307,7 +390,7 @@ public class ObjectFinderSystem : MonoBehaviour
                 return;
             }
         }
-        else // Google
+        else
         {
             if (string.IsNullOrWhiteSpace(googleApiKey) || googleApiKey.Contains("PUT_GOOGLE"))
             {
@@ -330,12 +413,35 @@ public class ObjectFinderSystem : MonoBehaviour
             prevJpgQ = captureManager.jpgQuality;
             captureManager.jpgQuality = finderJpgQuality;
         }
-
-        // Target init
         targetRaw = targetRomanian;
         targetKey = NormalizeRo(targetRomanian);
 
-        // Default behavior for known targets (unchanged)
+      
+        if (targetKey == "geam") targetKey = "fereastra";
+        if (targetKey == "fereastră") targetKey = "fereastra";
+
+        occupancyMode = OccupancyMode.None;
+
+        if (targetKey.Contains("scaun") && (targetKey.Contains("liber") || targetKey.Contains("libera")))
+        {
+            occupancyMode = OccupancyMode.ChairFree;
+            targetKey = "scaun";
+        }
+        else if ((targetKey.Contains("masa") || targetKey.Contains("birou")) &&
+                 (targetKey.Contains("liber") || targetKey.Contains("libera")))
+        {
+            occupancyMode = OccupancyMode.TableFree;
+            targetKey = "masa";
+        }
+
+        occupancyVotes.Clear();
+        occupancyIntroSpoken = false;
+        occupancyResolved = false;
+        currentCandidateRect01 = new Rect();
+        rejectedTargets.Clear();
+
+
+
         wantedLabelsEn = GetExpectedEnglishLabels(targetKey);
 
         // Translation for unknown targets (NEW, safe)
@@ -375,17 +481,47 @@ public class ObjectFinderSystem : MonoBehaviour
         lastSeenTime = -999f;
         lastLostAnnounceTime = -999f;
         lastCloseAnnounceTime = -999f;
+        lostAnnouncedForCurrentLoss = false;
+        searchProgressSpokenOnce = false;
+
+        lastDirectionSpeakTime = -999f;
+        lastSpokenDirection = Side.Center;
 
         nextAzureBoxFallbackTime = -999f;
         lastNoBoxSpeakTime = -999f;
+        lastSearchProgressSpeakTime = Time.time;
+        lastVisionErrorSpeakTime = -999f;
+        consecutiveCaptureFails = 0;
+        consecutiveVisionFails = 0;
 
-        uiAnimator?.ShowProcessing($"Caut: {targetRomanian}. Îndreaptă privirea spre obiect și mișcă încet capul.");
-        tts?.Speak($"Caut {targetRomanian}. Îndreaptă privirea spre obiect și mișcă încet capul.");
+        string displayTarget = GetRomanianDisplayName(targetKey, targetRomanian);
+
+        uiAnimator?.ShowProcessing(
+            $"Caut: {displayTarget}. Mișcă încet capul stânga-dreapta. {WhenIFindObjectText(targetKey)}, urmează sunetul."
+        );
+        if (preferPhoneControlInstructions)
+        {
+            tts?.Speak(
+                $"Caut {displayTarget}. Mișcă încet capul stânga-dreapta. " +
+                "Când ajungi la obiect, apasă lung pe ecranul telefonului pentru a opri funcția."
+            );
+        }
+        else
+        {
+            tts?.Speak(
+             $"Caut {displayTarget}. Mișcă încet capul stânga-dreapta. " +
+             $"{WhenIFindObjectText(targetKey)}, urmează sunetul. " +
+             "Spune AM GĂSIT ca să opresc căutarea, sau spune STOP ori ridică palma."
+            );
+        }
     }
 
     public void StopFind(bool silent = false)
     {
         if (!running) return;
+
+        // Oprește imediat orice mesaj vocal vechi din căutare.
+        tts?.StopNow();
 
         running = false;
         requestInFlight = false;
@@ -418,39 +554,48 @@ public class ObjectFinderSystem : MonoBehaviour
             uiAnimator?.ShowSuccess("Am oprit căutarea.");
             tts?.Speak("Am oprit căutarea.");
         }
+        occupancyMode = OccupancyMode.None;
+        occupancyVotes.Clear();
+        occupancyIntroSpoken = false;
+        occupancyResolved = false;
+        currentCandidateRect01 = new Rect();
+        rejectedTargets.Clear();
+
     }
 
     private void Update()
     {
         if (!running) return;
-
-        // Wait until translation finishes for unknown targets
         if (!translationReady) return;
 
-        // timeout doar dacă NU am găsit încă
         if (!announcedFound && maxSearchSeconds > 0f && Time.time - startTime > maxSearchSeconds)
         {
             if (announcedTagOnly)
             {
                 uiAnimator?.ShowError("Nu am putut localiza precis. Încearcă mai aproape și mișcă încet capul.");
-                tts?.Speak("Nu am putut localiza precis. Încearcă mai aproape și mișcă încet capul.");
+                tts?.Speak("Nu am putut localiza precis. Mișcă încet capul din nou.");
             }
             else
             {
-                uiAnimator?.ShowError("Nu am găsit. Încearcă mai aproape și cu lumină mai bună.");
-                tts?.Speak("Nu am găsit. Încearcă mai aproape și cu lumină mai bună.");
+                uiAnimator?.ShowError("Nu am găsit obiectul. Rotește încet capul din nou spre stânga și dreapta.");
+                tts?.Speak("Nu am găsit obiectul. Rotește încet capul din nou spre stânga și dreapta.");
             }
 
             StopFind(silent: true);
             return;
         }
+        if (!announcedFound && !requestInFlight)
+        {
+            SpeakSearchProgressIfNeeded();
+        }
 
-        // după ce a fost găsit: dacă îl pierdem din vedere
         if (announcedFound && lastSeenTime > 0f && Time.time - lastSeenTime > lostAfterSeconds && lastStrength01 < 0.05f)
         {
-            if (Time.time - lastLostAnnounceTime > lostAnnounceCooldown)
+            if (!lostAnnouncedForCurrentLoss)
             {
+                lostAnnouncedForCurrentLoss = true;
                 lastLostAnnounceTime = Time.time;
+
                 uiAnimator?.ShowProcessing("Am pierdut obiectul. Mișcă încet capul stânga-dreapta.");
                 tts?.Speak("Am pierdut obiectul. Mișcă încet capul stânga-dreapta.");
             }
@@ -466,7 +611,20 @@ public class ObjectFinderSystem : MonoBehaviour
                 if (!running) { requestInFlight = false; return; }
                 if (!translationReady) { requestInFlight = false; return; }
 
-                if (bytes == null || bytes.Length < 2000) { requestInFlight = false; return; }
+                if (bytes == null || bytes.Length < 2000)
+                {
+                    requestInFlight = false;
+                    consecutiveCaptureFails++;
+
+                    if (consecutiveCaptureFails >= 2)
+                    {
+                        SpeakVisionErrorIfNeeded("Nu pot captura imaginea pentru căutare. Verifică permisiunea camerei și încearcă din nou.");
+                    }
+
+                    return;
+                }
+
+                consecutiveCaptureFails = 0;
                 StartCoroutine(Analyze(bytes));
             });
         }
@@ -515,7 +673,19 @@ public class ObjectFinderSystem : MonoBehaviour
             {
                 lastStrength01 = 0f;
                 hasBoundingBox = false;
+                consecutiveVisionFails++;
+
                 Debug.LogWarning($"[ObjectFinder][Azure] FAIL {req.responseCode} {req.error}");
+
+                if (req.responseCode == 400 || req.responseCode == 401 || req.responseCode == 403)
+                {
+                    SpeakVisionErrorIfNeeded("Azure Vision nu răspunde corect. Verifică cheia Azure Vision și endpoint-ul.");
+                }
+                else
+                {
+                    SpeakVisionErrorIfNeeded("Am probleme cu analiza imaginii prin Azure Vision.");
+                }
+
                 yield break;
             }
 
@@ -546,10 +716,24 @@ public class ObjectFinderSystem : MonoBehaviour
     {
         string base64 = Convert.ToBase64String(bytes);
 
-        string features =
-            useLabelFallback
-                ? "[{\"type\":\"OBJECT_LOCALIZATION\",\"maxResults\":10},{\"type\":\"LABEL_DETECTION\",\"maxResults\":10}]"
-                : "[{\"type\":\"OBJECT_LOCALIZATION\",\"maxResults\":10}]";
+        string features;
+
+        if (targetKey == "semn iesire")
+        {
+            features =
+                "["
+                + "{\"type\":\"OBJECT_LOCALIZATION\",\"maxResults\":10},"
+                + "{\"type\":\"TEXT_DETECTION\",\"maxResults\":10},"
+                + "{\"type\":\"LABEL_DETECTION\",\"maxResults\":10}"
+                + "]";
+        }
+        else
+        {
+            features =
+                useLabelFallback
+                    ? "[{\"type\":\"OBJECT_LOCALIZATION\",\"maxResults\":10},{\"type\":\"LABEL_DETECTION\",\"maxResults\":10}]"
+                    : "[{\"type\":\"OBJECT_LOCALIZATION\",\"maxResults\":10}]";
+        }
 
         string bodyJson =
             "{"
@@ -576,9 +760,20 @@ public class ObjectFinderSystem : MonoBehaviour
             {
                 lastStrength01 = 0f;
                 hasBoundingBox = false;
+                consecutiveVisionFails++;
 
                 string body = req.downloadHandler != null ? req.downloadHandler.text : "";
                 Debug.LogWarning($"[ObjectFinder][Google] FAIL {req.responseCode} {req.error} body={body}");
+
+                if (req.responseCode == 400 || req.responseCode == 401 || req.responseCode == 403)
+                {
+                    SpeakVisionErrorIfNeeded("Google Vision nu răspunde corect. Verifică cheia Google Vision API și dacă API-ul este activ.");
+                }
+                else
+                {
+                    SpeakVisionErrorIfNeeded("Am probleme cu analiza imaginii. Verifică internetul și serviciul Google Vision.");
+                }
+
                 yield break;
             }
 
@@ -605,7 +800,7 @@ public class ObjectFinderSystem : MonoBehaviour
                 if (Time.time - lastNoBoxSpeakTime > noBoxSpeakCooldown)
                 {
                     lastNoBoxSpeakTime = Time.time;
-                    tts?.Speak("Îl detectez posibil în zonă, dar nu am direcție. Mișcă încet capul și apropie-te.");
+                    tts?.Speak($"{PossibleDetectionText(targetKey)}, dar nu am direcție. Mișcă încet capul și apropie-te.");
                 }
             }
 
@@ -667,9 +862,7 @@ public class ObjectFinderSystem : MonoBehaviour
         }
     }
 
-    // =========================================================
-    // Shared apply hit
-    // =========================================================
+ 
     private void ApplyHit(HitInfo hit, string compactDebug, bool tagOnlyHit)
     {
         hasBoundingBox = hit.hasBox;
@@ -682,18 +875,105 @@ public class ObjectFinderSystem : MonoBehaviour
             uiAnimator?.ShowProcessing(compactDebug);
         }
 
+     
+        if (occupancyMode != OccupancyMode.None && hit.found && hit.hasBox && !occupancyResolved)
+        {
+            currentCandidateRect01 = hit.targetRect01;
+
+            if (!occupancyIntroSpoken)
+            {
+                occupancyIntroSpoken = true;
+                uiAnimator?.ShowProcessing("Verific dacă locul este liber.");
+                tts?.Speak("Verific dacă locul este liber.");
+            }
+            if (hit.occupancyEvaluated)
+            {
+                // Dacă într-un cadru vedem clar obiect/persoană PE scaun,
+                // nu mai așteptăm voturi. Respinge imediat scaunul.
+                if (!hit.looksFree)
+                {
+                    RememberRejectedTarget(currentCandidateRect01);
+                    occupancyVotes.Clear();
+                    currentCandidateRect01 = new Rect();
+
+                    uiAnimator?.ShowProcessing("Acest scaun pare ocupat. Caut altul.");
+                    tts?.Speak("Acest scaun pare ocupat. Caut altul.");
+
+                    hasBoundingBox = false;
+                    lastStrength01 = 0f;
+                    return;
+                }
+
+                occupancyVotes.Enqueue(true);
+
+                while (occupancyVotes.Count > occupancyCheckFrames)
+                    occupancyVotes.Dequeue();
+
+                if (occupancyVotes.Count >= occupancyCheckFrames)
+                {
+                    int freeVotes = occupancyVotes.Count(v => v);
+
+                    if (freeVotes >= occupancyFreeVotesNeeded)
+                    {
+                        occupancyResolved = true;
+                        announcedFound = true;
+                        lastSeenTime = Time.time;
+                        lostAnnouncedForCurrentLoss = false;
+
+                        uiAnimator?.ShowSuccess("Am găsit un scaun liber. Urmează sunetul.");
+                        tts?.Speak("Am găsit un scaun liber. Urmează sunetul.");
+
+                        if (hit.area01 >= closeAreaThreshold01 &&
+                            Time.time - lastCloseAnnounceTime > closeAnnounceCooldown)
+                        {
+                            lastCloseAnnounceTime = Time.time;
+
+                            string where =
+                                hit.side == Side.Left ? "ușor în stânga" :
+                                hit.side == Side.Right ? "ușor în dreapta" :
+                                "în față";
+
+                            uiAnimator?.ShowSuccess("Scaunul liber este foarte aproape, " + where + ".");
+                            tts?.Speak("Scaunul liber este foarte aproape, " + where + ".");
+                        }
+
+                        return;
+                    }
+                }
+            }
+
+            return;
+        }
+
+
         if (hit.found && hit.hasBox)
         {
             lastSeenTime = Time.time;
+            lostAnnouncedForCurrentLoss = false;
 
             if (!announcedFound)
             {
                 announcedFound = true;
-                uiAnimator?.ShowSuccess("Am găsit. Urmează sunetul.");
-                tts?.Speak("Am găsit. Urmează sunetul.");
+
+                if (targetKey == "semn iesire")
+                {
+                    uiAnimator?.ShowSuccess("Am detectat calea de ieșire. Urmează sunetul.");
+                    tts?.Speak("Am detectat calea de ieșire. Urmează sunetul.");
+                }
+                else
+                {
+                    string obj = GetRomanianDisplayName(targetKey, targetRaw);
+                    uiAnimator?.ShowSuccess($"Am găsit {obj}. Urmează sunetul.");
+                    tts?.Speak($"Am găsit {obj}. Urmează sunetul.");
+                }
+
+                SpeakDirectionGuidanceIfNeeded(hit, force: true);
+            }
+            else
+            {
+                SpeakDirectionGuidanceIfNeeded(hit, force: false);
             }
 
-            // ✅ “Foarte aproape” (cu direcție)
             if (hit.area01 >= closeAreaThreshold01)
             {
                 if (Time.time - lastCloseAnnounceTime > closeAnnounceCooldown)
@@ -722,8 +1002,7 @@ public class ObjectFinderSystem : MonoBehaviour
             }
             else
             {
-                // Dacă announceFoundOnlyWhenHasBox e ON, nu “stricăm” regula; UI rămâne informativ.
-                uiAnimator?.ShowProcessing("Posibil detectat, dar nu am direcție. Îndreaptă camera mai direct spre obiect.");
+                uiAnimator?.ShowProcessing("Posibil detectat, dar nu am direcție.");
             }
         }
     }
@@ -735,6 +1014,11 @@ public class ObjectFinderSystem : MonoBehaviour
         public float strength01;
         public Side side;
         public float area01;
+
+        public Rect targetRect01;
+
+        public bool occupancyEvaluated;
+        public bool looksFree;
     }
 
     // =========================================================
@@ -773,8 +1057,35 @@ public class ObjectFinderSystem : MonoBehaviour
         }
 
         compactDebug = $"Caut {targetKey} | Obj: {objDbg} | Tag: {tagDbg}";
+        // Mod special pentru semn de ieșire: dacă găsim și ușa asociată, ghidăm spre ușă
+        if (targetKey == "semn iesire")
+        {
+            if (TryFindAzureDoorNearExitSign(
+                root?.objects,
+                captureManager != null ? captureManager.LastWidth : 0,
+                captureManager != null ? captureManager.LastHeight : 0,
+                out Rect exitDoorRect01,
+                out Side exitDoorSide,
+                out float exitDoorStrength01,
+                out float exitDoorArea01))
+            {
+                hit.found = true;
+                hit.hasBox = true;
+                hit.side = exitDoorSide;
+                hit.strength01 = exitDoorStrength01;
+                hit.area01 = exitDoorArea01;
+                hit.targetRect01 = exitDoorRect01;
 
-        var objHit = FindBestAzureObject(root?.objects, captureManager != null ? captureManager.LastWidth : 0, captureManager != null ? captureManager.LastHeight : 0);
+                compactDebug = $"Caut ieșirea | Ușa asociată semnului EXIT este {(exitDoorSide == Side.Left ? "stânga" : exitDoorSide == Side.Right ? "dreapta" : "centru")}";
+                return true;
+            }
+        }
+        var objHit = FindBestAzureObject(
+        root?.objects,
+        captureManager != null ? captureManager.LastWidth : 0,
+        captureManager != null ? captureManager.LastHeight : 0
+ );
+
         if (objHit.found)
         {
             hit.found = true;
@@ -782,6 +1093,14 @@ public class ObjectFinderSystem : MonoBehaviour
             hit.side = objHit.side;
             hit.strength01 = objHit.strength01;
             hit.area01 = objHit.area01;
+            hit.targetRect01 = objHit.rect01;
+
+            if (occupancyMode != OccupancyMode.None)
+            {
+                hit.occupancyEvaluated = true;
+                hit.looksFree = EvaluateAzureOccupancy(root?.objects, objHit.rect01);
+            }
+
             return true;
         }
 
@@ -800,10 +1119,13 @@ public class ObjectFinderSystem : MonoBehaviour
         return false;
     }
 
-    private (bool found, Side side, float strength01, float area01) FindBestAzureObject(AzureVisionObject[] objs, int imgW, int imgH)
+    private (bool found, Side side, float strength01, float area01, Rect rect01) FindBestAzureObject(AzureVisionObject[] objs, int imgW, int imgH)
     {
-        if (objs == null || objs.Length == 0) return (false, Side.Center, 0f, 0f);
-        if (string.IsNullOrWhiteSpace(targetKey)) return (false, Side.Center, 0f, 0f);
+        if (objs == null || objs.Length == 0)
+            return (false, Side.Center, 0f, 0f, new Rect());
+
+        if (string.IsNullOrWhiteSpace(targetKey))
+            return (false, Side.Center, 0f, 0f, new Rect());
 
         var wanted = GetWantedLabels();
         float confMin = GetMinConfidenceForTarget(targetKey);
@@ -811,14 +1133,19 @@ public class ObjectFinderSystem : MonoBehaviour
         float bestScore = 0f;
         AzureVisionObject bestObj = null;
         float bestArea01 = 0f;
+        Rect bestRect01 = new Rect();
 
         foreach (var o in objs)
         {
-            if (o == null || o.rectangle == null) continue;
-            if (o.confidence < confMin) continue;
+            if (o == null || o.rectangle == null)
+                continue;
+
+            if (o.confidence < confMin)
+                continue;
 
             string name = (o.@object ?? "").Trim().ToLowerInvariant();
-            if (!wanted.Any(w => MatchesWanted(name, w))) continue;
+            if (!wanted.Any(w => MatchesWanted(name, w)))
+                continue;
 
             float area01 = 0f;
             if (imgW > 0 && imgH > 0)
@@ -827,30 +1154,42 @@ public class ObjectFinderSystem : MonoBehaviour
                 area01 = Mathf.Clamp01(area / (imgW * imgH));
             }
 
+            Rect rect01 = RectFromAzure(o.rectangle, imgW, imgH);
+
+            // dacă folosești memoria temporară pentru scaune / mese respinse
+            if (IsRejectedTargetRect(rect01))
+                continue;
+
             float score = (o.confidence * 0.80f) + (area01 * 0.20f);
 
             if (logMatches)
+            {
                 Debug.Log($"[ObjectFinder][Azure] match obj={name} conf={o.confidence:0.00} area01={area01:0.00} score={score:0.00}");
+            }
 
             if (score > bestScore)
             {
                 bestScore = score;
                 bestObj = o;
                 bestArea01 = area01;
+                bestRect01 = rect01;
             }
         }
 
-        if (bestObj == null) return (false, Side.Center, 0f, 0f);
+        if (bestObj == null)
+            return (false, Side.Center, 0f, 0f, new Rect());
 
-        float cx = bestObj.rectangle.x + bestObj.rectangle.w * 0.5f;
-        float nx = (imgW > 0) ? Mathf.Clamp01(cx / imgW) : 0.5f;
+        float nx = Mathf.Clamp01(bestRect01.center.x);
 
-        Side side = nx < 0.40f ? Side.Left : (nx > 0.60f ? Side.Right : Side.Center);
+        Side side =
+            nx < 0.40f ? Side.Left :
+            nx > 0.60f ? Side.Right :
+            Side.Center;
 
         float center01 = 1f - Mathf.Clamp01(Mathf.Abs(nx - 0.5f) / 0.5f);
         float strength01 = Mathf.Clamp01(bestScore * 0.65f + center01 * 0.35f);
 
-        return (true, side, strength01, bestArea01);
+        return (true, side, strength01, bestArea01, bestRect01);
     }
 
     private (bool found, float confidence01) FindBestAzureTag(AzureVisionTag[] tags)
@@ -922,7 +1261,59 @@ public class ObjectFinderSystem : MonoBehaviour
         }
 
         compactDebug = $"Caut {targetKey} | Obj: {objDbg} | Label: {labDbg}";
+        // Mod special pentru semn de ieșire: dacă găsim și ușa asociată, ghidăm spre ușă
+        if (targetKey == "semn iesire")
+        {
+            int imgW = captureManager != null ? captureManager.LastWidth : 0;
+            int imgH = captureManager != null ? captureManager.LastHeight : 0;
 
+            // 1) Întâi: semnul EXIT / IESIRE din text
+            if (TryFindGoogleExitText(
+                r?.textAnnotations,
+                imgW,
+                imgH,
+                out Rect signRect01,
+                out Side signSide,
+                out float signStrength01,
+                out float signArea01))
+            {
+                // 2) Doar după ce avem semnul, căutăm ușa apropiată lui
+                if (TryFindGoogleDoorNearExitText(
+                    r?.localizedObjectAnnotations,
+                    signRect01,
+                    out Rect exitDoorRect01,
+                    out Side exitDoorSide,
+                    out float exitDoorStrength01,
+                    out float exitDoorArea01))
+                {
+                    hit.found = true;
+                    hit.hasBox = true;
+                    hit.side = exitDoorSide;
+                    hit.strength01 = exitDoorStrength01;
+                    hit.area01 = exitDoorArea01;
+                    hit.targetRect01 = exitDoorRect01;
+
+                    compactDebug = $"Caut ieșirea | Am găsit semnul EXIT și ușa este {(exitDoorSide == Side.Left ? "stânga" : exitDoorSide == Side.Right ? "dreapta" : "centru")}";
+                    return true;
+                }
+
+                // dacă nu avem ușa, ghidăm totuși către semn
+                hit.found = true;
+                hit.hasBox = true;
+                hit.side = signSide;
+                hit.strength01 = signStrength01;
+                hit.area01 = signArea01;
+                hit.targetRect01 = signRect01;
+
+                compactDebug = $"Caut ieșirea | Am găsit semnul EXIT {(signSide == Side.Left ? "în stânga" : signSide == Side.Right ? "în dreapta" : "în centru")}";
+                return true;
+            }
+
+            // IMPORTANT:
+            // dacă nu există semn detectat, NU vrem să tratăm simpla ușă ca ieșire.
+            // Așa evităm confuzia între "usa" și "exit".
+            return false;
+        }
         var objHit = FindBestGoogleObject(r?.localizedObjectAnnotations);
         if (objHit.found)
         {
@@ -931,6 +1322,14 @@ public class ObjectFinderSystem : MonoBehaviour
             hit.side = objHit.side;
             hit.strength01 = objHit.strength01;
             hit.area01 = objHit.area01;
+            hit.targetRect01 = objHit.rect01;
+
+            if (occupancyMode != OccupancyMode.None)
+            {
+                hit.occupancyEvaluated = true;
+                hit.looksFree = EvaluateGoogleOccupancy(r?.localizedObjectAnnotations, objHit.rect01);
+            }
+
             return true;
         }
 
@@ -952,10 +1351,10 @@ public class ObjectFinderSystem : MonoBehaviour
         return false;
     }
 
-    private (bool found, Side side, float strength01, float area01) FindBestGoogleObject(GoogleLocalizedObjectAnnotation[] objs)
+    private (bool found, Side side, float strength01, float area01, Rect rect01) FindBestGoogleObject(GoogleLocalizedObjectAnnotation[] objs)
     {
-        if (objs == null || objs.Length == 0) return (false, Side.Center, 0f, 0f);
-        if (string.IsNullOrWhiteSpace(targetKey)) return (false, Side.Center, 0f, 0f);
+        if (objs == null || objs.Length == 0) return (false, Side.Center, 0f, 0f, new Rect());
+        if (string.IsNullOrWhiteSpace(targetKey)) return (false, Side.Center, 0f, 0f, new Rect());
 
         var wanted = GetWantedLabels();
         float confMin = GetMinConfidenceForTarget(targetKey);
@@ -964,6 +1363,7 @@ public class ObjectFinderSystem : MonoBehaviour
         GoogleLocalizedObjectAnnotation bestObj = null;
         float bestArea01 = 0f;
         float bestCenterX = 0.5f;
+        Rect bestRect01 = new Rect();
 
         foreach (var o in objs)
         {
@@ -976,19 +1376,12 @@ public class ObjectFinderSystem : MonoBehaviour
             if (o.boundingPoly == null || o.boundingPoly.normalizedVertices == null || o.boundingPoly.normalizedVertices.Length == 0)
                 continue;
 
-            float minX = 1f, minY = 1f, maxX = 0f, maxY = 0f;
-            foreach (var v in o.boundingPoly.normalizedVertices)
-            {
-                minX = Mathf.Min(minX, v.x);
-                maxX = Mathf.Max(maxX, v.x);
-                minY = Mathf.Min(minY, v.y);
-                maxY = Mathf.Max(maxY, v.y);
-            }
+            Rect rect01 = RectFromGoogle(o.boundingPoly);
+            if (IsRejectedTargetRect(rect01))
+                continue;
 
-            float w = Mathf.Clamp01(maxX - minX);
-            float h = Mathf.Clamp01(maxY - minY);
-            float area01 = Mathf.Clamp01(w * h);
-            float centerX = Mathf.Clamp01((minX + maxX) * 0.5f);
+            float area01 = Mathf.Clamp01(rect01.width * rect01.height);
+            float centerX = Mathf.Clamp01(rect01.center.x);
 
             float score = (o.score * 0.80f) + (area01 * 0.20f);
 
@@ -1001,17 +1394,18 @@ public class ObjectFinderSystem : MonoBehaviour
                 bestObj = o;
                 bestArea01 = area01;
                 bestCenterX = centerX;
+                bestRect01 = rect01;
             }
         }
 
-        if (bestObj == null) return (false, Side.Center, 0f, 0f);
+        if (bestObj == null) return (false, Side.Center, 0f, 0f, new Rect());
 
         Side side = bestCenterX < 0.40f ? Side.Left : (bestCenterX > 0.60f ? Side.Right : Side.Center);
 
         float center01 = 1f - Mathf.Clamp01(Mathf.Abs(bestCenterX - 0.5f) / 0.5f);
         float strength01 = Mathf.Clamp01(bestScore * 0.65f + center01 * 0.35f);
 
-        return (true, side, strength01, bestArea01);
+        return (true, side, strength01, bestArea01, bestRect01);
     }
 
     private (bool found, float confidence01) FindBestGoogleLabel(GoogleLabelAnnotation[] labels)
@@ -1076,9 +1470,31 @@ public class ObjectFinderSystem : MonoBehaviour
     // =========================================================
     private float GetMinConfidenceForTarget(string target)
     {
-        if (target == "telefon" || target == "laptop" || target == "sticla" || target == "cana"
-            || target == "usa" || target == "televizor" || target == "pat" || target == "masa" || target == "canapea"
-            || target == "dulap")
+        if (target == "usa")
+            return 0.22f;
+
+        if (target == "semn iesire")
+            return 0.22f;
+
+        if (target == "fereastra")
+            return 0.22f;
+
+        if (target == "cos gunoi")
+            return 0.22f;
+
+        if (target == "dulap")
+            return 0.22f;
+
+        if (target == "masa")
+            return 0.26f;
+        if (targetKey == "ochelari")
+            return 0.24f;
+
+        if (target == "scaun")
+            return Mathf.Min(minConfidenceMedium, 0.28f);
+
+        if (target == "telefon" || target == "laptop" || target == "sticla" || target == "cana" ||
+            target == "televizor" || target == "pat" || target == "canapea")
             return minConfidenceMedium;
 
         return minConfidenceDefault;
@@ -1086,20 +1502,29 @@ public class ObjectFinderSystem : MonoBehaviour
 
     private static bool MatchesWanted(string detectedLabel, string wanted)
     {
-        if (string.IsNullOrWhiteSpace(detectedLabel) || string.IsNullOrWhiteSpace(wanted)) return false;
+        if (string.IsNullOrWhiteSpace(detectedLabel) || string.IsNullOrWhiteSpace(wanted))
+            return false;
 
         detectedLabel = detectedLabel.Trim().ToLowerInvariant();
         wanted = wanted.Trim().ToLowerInvariant();
 
-        if (wanted.Contains(" "))
-            return detectedLabel.Contains(wanted);
+        if (detectedLabel == wanted)
+            return true;
 
-        if (detectedLabel == wanted) return true;
+        if (detectedLabel.Contains(wanted) || wanted.Contains(detectedLabel))
+            return true;
 
-        var tokens = detectedLabel.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-        return tokens.Any(t => t == wanted);
+        var detectedTokens = detectedLabel.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+        var wantedTokens = wanted.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+
+        if (wantedTokens.All(w => detectedTokens.Contains(w)))
+            return true;
+
+        if (detectedTokens.Any(t => t == wanted))
+            return true;
+
+        return false;
     }
-
     private void PlayBeep(Side side)
     {
         if (beepSource == null || beepClip == null || headCamera == null) return;
@@ -1155,26 +1580,147 @@ public class ObjectFinderSystem : MonoBehaviour
         {
             case "telefon":
                 return new[] { "cell phone", "cellphone", "mobile phone", "smartphone", "iphone", "phone" };
+
             case "laptop":
                 return new[] { "laptop", "notebook", "notebook computer", "computer" };
+
             case "sticla":
                 return new[] { "bottle", "water bottle", "plastic bottle", "glass bottle" };
+
             case "cana":
                 return new[] { "cup", "mug", "coffee cup", "teacup" };
+
             case "usa":
-                return new[] { "door", "doorway", "entrance", "interior door", "front door" };
+                return new[]
+                {
+                    "door",
+                    "doorway",
+                    "entrance",
+                    "entryway",
+                    "front door",
+                    "interior door",
+                    "exit door",
+                    "room door",
+                    "gate"
+    };
+
             case "scaun":
                 return new[] { "chair", "armchair", "seat" };
+
+            case "scaun liber":
+                return new[] { "chair", "armchair", "seat" };
+
             case "masa":
-                return new[] { "table", "desk", "dining table", "coffee table", "work table" };
+                return new[]
+                {
+                    "table",
+                    "desk",
+                    "dining table",
+                    "coffee table",
+                    "work table",
+                    "office table",
+                    "kitchen table",
+                    "furniture"
+                };
+
+            case "masa libera":
+                return new[]
+                {
+                    "table",
+                    "desk",
+                    "dining table",
+                    "coffee table",
+                    "work table",
+                    "office table",
+                    "kitchen table",
+                    "furniture"
+    };
+
+
             case "televizor":
                 return new[] { "tv", "television", "television set", "monitor", "screen", "display" };
+
             case "pat":
                 return new[] { "bed", "bunk bed" };
+
             case "canapea":
                 return new[] { "couch", "sofa", "loveseat" };
+
             case "dulap":
-                return new[] { "wardrobe", "closet", "cabinet", "cupboard" };
+                return new[]
+                {
+                    "wardrobe",
+                    "closet",
+                    "cabinet",
+                    "cupboard",
+                    "armoire",
+                    "storage cabinet",
+                    "kitchen cabinet",
+                    "drawer",
+                    "chest of drawers",
+                    "dresser",
+                    "shelf",
+                    "bookcase",
+                    "bookshelf",
+                    "storage"
+            };
+
+            case "fereastra":
+                return new[]
+                {
+                    "window",
+                    "windowpane",
+                    "glass window",
+                    "pane",
+                    "glass",
+                    "casement window",
+                    "bay window",
+                    "window blind",
+                    "curtain"
+    };
+            case "semn iesire":
+                return new[]
+                {
+                "exit sign",
+                "emergency exit sign",
+                "emergency exit",
+                "fire exit",
+                "exit board",
+                "exit",
+                "sign",
+                "exit door",
+                "emergency door"
+    };
+
+            case "cos gunoi":
+                return new[]
+                {
+                    "trash can",
+                    "garbage can",
+                    "waste bin",
+                    "bin",
+                    "trash bin",
+                    "recycling bin",
+                    "wastebasket",
+                    "rubbish bin",
+                    "litter bin",
+                    "dustbin",
+                    "waste container",
+                    "container"
+    };
+            case "ochelari":
+                return new[]
+                {
+                    "glasses",
+                    "eyeglasses",
+                    "spectacles",
+                    "sunglasses",
+                    "goggles",
+                    "reading glasses",
+                    "vision care",
+                    "personal care"
+                };
+
             default:
                 return new[] { targetRo };
         }
@@ -1190,11 +1736,17 @@ public class ObjectFinderSystem : MonoBehaviour
             case "cana":
             case "usa":
             case "scaun":
+            case "scaun liber":
             case "masa":
+            case "masa libera":
             case "televizor":
             case "pat":
             case "canapea":
             case "dulap":
+            case "fereastra":
+            case "semn iesire":
+            case "cos gunoi":
+            case "ochelari":
                 return true;
             default:
                 return false;
@@ -1248,4 +1800,1149 @@ public class ObjectFinderSystem : MonoBehaviour
         }
         return sb.ToString().Normalize(NormalizationForm.FormC).Trim();
     }
+    private static Rect RectFromAzure(AzureRectangle r, int imgW, int imgH)
+    {
+        if (r == null || imgW <= 0 || imgH <= 0) return new Rect(0, 0, 0, 0);
+
+        float x = Mathf.Clamp01(r.x / (float)imgW);
+        float y = Mathf.Clamp01(r.y / (float)imgH);
+        float w = Mathf.Clamp01(r.w / (float)imgW);
+        float h = Mathf.Clamp01(r.h / (float)imgH);
+
+        return new Rect(x, y, w, h);
+    }
+
+    private static Rect RectFromGoogle(GoogleBoundingPoly poly)
+    {
+        if (poly == null || poly.normalizedVertices == null || poly.normalizedVertices.Length == 0)
+            return new Rect(0, 0, 0, 0);
+
+        float minX = 1f, minY = 1f, maxX = 0f, maxY = 0f;
+
+        foreach (var v in poly.normalizedVertices)
+        {
+            minX = Mathf.Min(minX, v.x);
+            minY = Mathf.Min(minY, v.y);
+            maxX = Mathf.Max(maxX, v.x);
+            maxY = Mathf.Max(maxY, v.y);
+        }
+
+        return new Rect(
+            Mathf.Clamp01(minX),
+            Mathf.Clamp01(minY),
+            Mathf.Clamp01(maxX - minX),
+            Mathf.Clamp01(maxY - minY)
+        );
+    }
+
+    private static float OverlapOnTarget(Rect target, Rect other)
+    {
+        float xMin = Mathf.Max(target.xMin, other.xMin);
+        float yMin = Mathf.Max(target.yMin, other.yMin);
+        float xMax = Mathf.Min(target.xMax, other.xMax);
+        float yMax = Mathf.Min(target.yMax, other.yMax);
+
+        float w = Mathf.Max(0f, xMax - xMin);
+        float h = Mathf.Max(0f, yMax - yMin);
+        float inter = w * h;
+        float targetArea = Mathf.Max(0.0001f, target.width * target.height);
+
+        return inter / targetArea;
+    }
+    private bool IsBlockingObjectForCurrentOccupancy(string label)
+    {
+        if (string.IsNullOrWhiteSpace(label)) return false;
+
+        label = label.Trim().ToLowerInvariant();
+
+        if (occupancyMode == OccupancyMode.ChairFree)
+        {
+            return label.Contains("person")
+                || label.Contains("human")
+                || label.Contains("man")
+                || label.Contains("woman")
+                || label.Contains("child")
+
+                || label.Contains("backpack")
+                || label.Contains("handbag")
+                || label.Contains("bag")
+                || label.Contains("suitcase")
+                || label.Contains("purse")
+                || label.Contains("tote")
+
+                || label.Contains("laptop")
+                || label.Contains("notebook")
+                || label.Contains("computer")
+                || label.Contains("tablet")
+                || label.Contains("phone")
+                || label.Contains("cell phone")
+                || label.Contains("mobile phone")
+
+                || label.Contains("book")
+                || label.Contains("magazine")
+                || label.Contains("paper")
+                || label.Contains("box")
+                || label.Contains("package")
+                || label.Contains("container")
+
+                || label.Contains("bottle")
+                || label.Contains("cup")
+                || label.Contains("plate")
+                || label.Contains("food")
+
+                || label.Contains("clothing")
+                || label.Contains("coat")
+                || label.Contains("jacket")
+                || label.Contains("hat")
+                || label.Contains("scarf")
+                || label.Contains("blanket")
+                || label.Contains("pillow")
+
+                || label.Contains("remote")
+                || label.Contains("keyboard")
+                || label.Contains("mouse")
+                || label.Contains("toy")
+                || label.Contains("object");
+        }
+
+        if (occupancyMode == OccupancyMode.TableFree)
+        {
+            return label.Contains("person")
+                || label.Contains("human")
+                || label.Contains("man")
+                || label.Contains("woman")
+                || label.Contains("child")
+                || label.Contains("backpack")
+                || label.Contains("handbag")
+                || label.Contains("bag")
+                || label.Contains("laptop")
+                || label.Contains("book")
+                || label.Contains("phone")
+                || label.Contains("cell phone")
+                || label.Contains("mobile phone")
+                || label.Contains("bottle")
+                || label.Contains("cup")
+                || label.Contains("plate")
+                || label.Contains("box")
+                || label.Contains("package")
+                || label.Contains("suitcase")
+                || label.Contains("food")
+                || label.Contains("container");
+        }
+
+        return false;
+    }
+    private void CleanupRejectedTargets()
+    {
+        rejectedTargets.RemoveAll(r => Time.time > r.until);
+    }
+
+    private bool IsRejectedTargetRect(Rect rect01)
+    {
+        CleanupRejectedTargets();
+
+        foreach (var r in rejectedTargets)
+        {
+            float overlap = OverlapOnTarget(rect01, r.rect);
+            if (overlap >= 0.45f)
+                return true;
+        }
+
+        return false;
+    }
+
+    private void RememberRejectedTarget(Rect rect01)
+    {
+        rejectedTargets.Add(new RejectedTargetMemory
+        {
+            rect = rect01,
+            until = Time.time + rejectedTargetMemorySeconds
+        });
+    }
+    private bool EvaluateAzureOccupancy(AzureVisionObject[] objs, Rect targetRect01)
+    {
+        if (occupancyMode == OccupancyMode.None) return true;
+
+        if (objs == null || objs.Length == 0)
+            return true;
+
+        foreach (var o in objs)
+        {
+            if (o == null || o.rectangle == null) continue;
+
+            string name = (o.@object ?? "").Trim().ToLowerInvariant();
+
+            // Ignorăm scaunul însuși și mobilierul apropiat.
+            if (IsSeatOrNearbyFurnitureLabel(name))
+                continue;
+
+            Rect other = RectFromAzure(o.rectangle, captureManager.LastWidth, captureManager.LastHeight);
+
+            if (occupancyMode == OccupancyMode.ChairFree)
+            {
+                if (IsPersonLabel(name))
+                {
+                    if (PersonActuallyOnChair(targetRect01, other))
+                        return false;
+
+                    continue;
+                }
+
+                // Pentru scaun: dacă Azure a localizat orice obiect real pe scaun,
+                // îl considerăm ocupat. Nu ne bazăm doar pe nume.
+                if (IsBlockingObjectForCurrentOccupancy(name) || IsGenericPhysicalObjectLabel(name))
+                {
+                    if (ObjectActuallyOnSeat(targetRect01, other))
+                        return false;
+                }
+            }
+            else if (occupancyMode == OccupancyMode.TableFree)
+            {
+                if (!IsBlockingObjectForCurrentOccupancy(name))
+                    continue;
+
+                float overlap = OverlapOnTarget(targetRect01, other);
+
+                if (overlap >= tableOccupiedOverlapThreshold)
+                    return false;
+            }
+        }
+
+        return true;
+    }
+    private bool EvaluateGoogleOccupancy(GoogleLocalizedObjectAnnotation[] objs, Rect targetRect01)
+    {
+        if (occupancyMode == OccupancyMode.None) return true;
+
+        if (objs == null || objs.Length == 0)
+            return true;
+
+        foreach (var o in objs)
+        {
+            if (o == null || o.boundingPoly == null) continue;
+
+            string name = (o.name ?? "").Trim().ToLowerInvariant();
+
+            if (IsSeatOrNearbyFurnitureLabel(name))
+                continue;
+
+            Rect other = RectFromGoogle(o.boundingPoly);
+
+            if (occupancyMode == OccupancyMode.ChairFree)
+            {
+                if (IsPersonLabel(name))
+                {
+                    if (PersonActuallyOnChair(targetRect01, other))
+                        return false;
+
+                    continue;
+                }
+
+                if (IsBlockingObjectForCurrentOccupancy(name) || IsGenericPhysicalObjectLabel(name))
+                {
+                    if (ObjectActuallyOnSeat(targetRect01, other))
+                        return false;
+                }
+            }
+            else if (occupancyMode == OccupancyMode.TableFree)
+            {
+                if (!IsBlockingObjectForCurrentOccupancy(name))
+                    continue;
+
+                float overlap = OverlapOnTarget(targetRect01, other);
+
+                if (overlap >= tableOccupiedOverlapThreshold)
+                    return false;
+            }
+        }
+
+        return true;
+    }
+    private static bool LabelMatchesAny(string detectedLabel, params string[] wanted)
+    {
+        if (string.IsNullOrWhiteSpace(detectedLabel)) return false;
+
+        string d = detectedLabel.Trim().ToLowerInvariant();
+
+        foreach (var w in wanted)
+        {
+            if (string.IsNullOrWhiteSpace(w)) continue;
+
+            string ww = w.Trim().ToLowerInvariant();
+
+            if (d == ww) return true;
+            if (d.Contains(ww) || ww.Contains(d)) return true;
+
+            var dt = d.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            var wt = ww.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+
+            if (wt.All(x => dt.Contains(x)))
+                return true;
+        }
+
+        return false;
+    }
+    private static float RectCenterDistance(Rect a, Rect b)
+    {
+        return Vector2.Distance(a.center, b.center);
+    }
+    private bool TryFindAzureDoorNearExitSign(
+    AzureVisionObject[] objs,
+    int imgW,
+    int imgH,
+    out Rect bestDoorRect01,
+    out Side bestDoorSide,
+    out float bestDoorStrength01,
+    out float bestDoorArea01)
+    {
+        bestDoorRect01 = new Rect();
+        bestDoorSide = Side.Center;
+        bestDoorStrength01 = 0f;
+        bestDoorArea01 = 0f;
+
+        if (objs == null || objs.Length == 0 || imgW <= 0 || imgH <= 0)
+            return false;
+
+        float signConfMin = GetMinConfidenceForTarget("semn iesire");
+        float doorConfMin = GetMinConfidenceForTarget("usa");
+
+        var exitCandidates = new List<(AzureVisionObject obj, Rect rect01, float area01)>();
+        var doorCandidates = new List<(AzureVisionObject obj, Rect rect01, float area01)>();
+
+        foreach (var o in objs)
+        {
+            if (o == null || o.rectangle == null) continue;
+
+            string name = (o.@object ?? "").Trim().ToLowerInvariant();
+            Rect rect01 = RectFromAzure(o.rectangle, imgW, imgH);
+            float area01 = Mathf.Clamp01(rect01.width * rect01.height);
+
+            if (o.confidence >= signConfMin &&
+                LabelMatchesAny(name, "exit sign", "emergency exit", "fire exit", "exit"))
+            {
+                exitCandidates.Add((o, rect01, area01));
+            }
+
+            if (o.confidence >= doorConfMin &&
+                LabelMatchesAny(name, "door", "doorway", "entrance", "interior door", "front door"))
+            {
+                doorCandidates.Add((o, rect01, area01));
+            }
+        }
+
+        if (exitCandidates.Count == 0 || doorCandidates.Count == 0)
+            return false;
+
+        float bestScore = -999f;
+        Rect chosenDoor = new Rect();
+        float chosenArea01 = 0f;
+
+        foreach (var sign in exitCandidates)
+        {
+            foreach (var door in doorCandidates)
+            {
+                float dist = RectCenterDistance(sign.rect01, door.rect01);
+
+                // bonus dacă ușa e sub semn sau aproape sub el
+                float verticalBonus = 0f;
+                if (door.rect01.center.y > sign.rect01.center.y)
+                    verticalBonus = 0.12f;
+
+                float overlapX = Mathf.Max(0f,
+                    Mathf.Min(sign.rect01.xMax, door.rect01.xMax) - Mathf.Max(sign.rect01.xMin, door.rect01.xMin));
+
+                float alignBonus = overlapX > 0.05f ? 0.12f : 0f;
+
+                float score =
+                    (door.obj.confidence * 0.50f) +
+                    (sign.obj.confidence * 0.20f) +
+                    (door.area01 * 0.15f) +
+                    ((1f - Mathf.Clamp01(dist / 0.8f)) * 0.15f) +
+                    verticalBonus +
+                    alignBonus;
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    chosenDoor = door.rect01;
+                    chosenArea01 = door.area01;
+                }
+            }
+        }
+
+        if (bestScore < 0f)
+            return false;
+
+        float nx = Mathf.Clamp01(chosenDoor.center.x);
+
+        bestDoorSide =
+            nx < 0.40f ? Side.Left :
+            nx > 0.60f ? Side.Right :
+            Side.Center;
+
+        float center01 = 1f - Mathf.Clamp01(Mathf.Abs(nx - 0.5f) / 0.5f);
+        bestDoorStrength01 = Mathf.Clamp01(0.65f + center01 * 0.35f);
+        bestDoorArea01 = chosenArea01;
+        bestDoorRect01 = chosenDoor;
+
+        return true;
+    }
+
+    private bool TryFindGoogleDoorNearExitSign(
+    GoogleLocalizedObjectAnnotation[] objs,
+    out Rect bestDoorRect01,
+    out Side bestDoorSide,
+    out float bestDoorStrength01,
+    out float bestDoorArea01)
+    {
+        bestDoorRect01 = new Rect();
+        bestDoorSide = Side.Center;
+        bestDoorStrength01 = 0f;
+        bestDoorArea01 = 0f;
+
+        if (objs == null || objs.Length == 0)
+            return false;
+
+        float signConfMin = GetMinConfidenceForTarget("semn iesire");
+        float doorConfMin = GetMinConfidenceForTarget("usa");
+
+        var exitCandidates = new List<(GoogleLocalizedObjectAnnotation obj, Rect rect01, float area01)>();
+        var doorCandidates = new List<(GoogleLocalizedObjectAnnotation obj, Rect rect01, float area01)>();
+
+        foreach (var o in objs)
+        {
+            if (o == null || o.boundingPoly == null) continue;
+
+            string name = (o.name ?? "").Trim().ToLowerInvariant();
+            Rect rect01 = RectFromGoogle(o.boundingPoly);
+            float area01 = Mathf.Clamp01(rect01.width * rect01.height);
+
+            if (o.score >= signConfMin &&
+                LabelMatchesAny(name, "exit sign", "emergency exit", "fire exit", "exit"))
+            {
+                exitCandidates.Add((o, rect01, area01));
+            }
+
+            if (o.score >= doorConfMin &&
+                LabelMatchesAny(name, "door", "doorway", "entrance", "interior door", "front door"))
+            {
+                doorCandidates.Add((o, rect01, area01));
+            }
+        }
+
+        if (exitCandidates.Count == 0 || doorCandidates.Count == 0)
+            return false;
+
+        float bestScore = -999f;
+        Rect chosenDoor = new Rect();
+        float chosenArea01 = 0f;
+
+        foreach (var sign in exitCandidates)
+        {
+            foreach (var door in doorCandidates)
+            {
+                float dist = RectCenterDistance(sign.rect01, door.rect01);
+
+                float verticalBonus = 0f;
+                if (door.rect01.center.y > sign.rect01.center.y)
+                    verticalBonus = 0.12f;
+
+                float overlapX = Mathf.Max(0f,
+                    Mathf.Min(sign.rect01.xMax, door.rect01.xMax) - Mathf.Max(sign.rect01.xMin, door.rect01.xMin));
+
+                float alignBonus = overlapX > 0.05f ? 0.12f : 0f;
+
+                float score =
+                    (door.obj.score * 0.50f) +
+                    (sign.obj.score * 0.20f) +
+                    (door.area01 * 0.15f) +
+                    ((1f - Mathf.Clamp01(dist / 0.8f)) * 0.15f) +
+                    verticalBonus +
+                    alignBonus;
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    chosenDoor = door.rect01;
+                    chosenArea01 = door.area01;
+                }
+            }
+        }
+
+        if (bestScore < 0f)
+            return false;
+
+        float nx = Mathf.Clamp01(chosenDoor.center.x);
+
+        bestDoorSide =
+            nx < 0.40f ? Side.Left :
+            nx > 0.60f ? Side.Right :
+            Side.Center;
+
+        float center01 = 1f - Mathf.Clamp01(Mathf.Abs(nx - 0.5f) / 0.5f);
+        bestDoorStrength01 = Mathf.Clamp01(0.65f + center01 * 0.35f);
+        bestDoorArea01 = chosenArea01;
+        bestDoorRect01 = chosenDoor;
+
+        return true;
+    }
+    [Serializable]
+    private class GoogleTextAnnotation
+    {
+        public string description;
+        public GoogleBoundingPoly boundingPoly;
+    }
+
+    [Serializable]
+    private class GoogleVertex
+    {
+        public int x;
+        public int y;
+    }
+ 
+    private bool IsExitText(string s)
+    {
+        if (string.IsNullOrWhiteSpace(s)) return false;
+
+        string n = " " + NormalizeRo(s) + " ";
+
+        return n.Contains(" exit ")
+            || n.Contains(" iesire ")
+            || n.Contains(" emergency exit ")
+            || n.Contains(" fire exit ");
+    }
+    private bool TryFindGoogleExitText(
+    GoogleTextAnnotation[] texts,
+    int imgW,
+    int imgH,
+    out Rect signRect01,
+    out Side signSide,
+    out float signStrength01,
+    out float signArea01)
+    {
+        signRect01 = new Rect();
+        signSide = Side.Center;
+        signStrength01 = 0f;
+        signArea01 = 0f;
+
+        if (texts == null || texts.Length == 0)
+            return false;
+
+        float bestScore = -999f;
+        Rect bestRect = new Rect();
+
+        for (int i = 0; i < texts.Length; i++)
+        {
+            var t = texts[i];
+            if (t == null || string.IsNullOrWhiteSpace(t.description) || t.boundingPoly == null)
+                continue;
+
+            // textAnnotations[0] este de obicei tot textul din imagine
+            // pentru semn vrem cuvintele / grupurile individuale
+            if (i == 0 && texts.Length > 1)
+                continue;
+
+            if (!IsExitText(t.description))
+                continue;
+
+            Rect rect01 = RectFromGoogleTextPoly(t.boundingPoly, imgW, imgH);
+            if (rect01.width <= 0.001f || rect01.height <= 0.001f)
+                continue;
+
+            float area01 = Mathf.Clamp01(rect01.width * rect01.height);
+            float centerX = Mathf.Clamp01(rect01.center.x);
+            float center01 = 1f - Mathf.Clamp01(Mathf.Abs(centerX - 0.5f) / 0.5f);
+
+            string textNorm = NormalizeRo(t.description);
+
+            float keywordBonus = 0f;
+            if (textNorm == "exit" || textNorm == "iesire")
+                keywordBonus = 0.20f;
+            else if (textNorm.Contains("emergency exit") || textNorm.Contains("fire exit"))
+                keywordBonus = 0.16f;
+            else if (textNorm.Contains("exit") || textNorm.Contains("iesire"))
+                keywordBonus = 0.12f;
+
+            // penalizăm bbox-uri uriașe care probabil vin din text prost agregat
+            float hugePenalty = area01 > 0.35f ? 0.20f : 0f;
+
+            float score =
+                (area01 * 0.35f) +
+                (center01 * 0.25f) +
+                keywordBonus -
+                hugePenalty;
+
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestRect = rect01;
+                signArea01 = area01;
+            }
+        }
+
+        if (bestScore < 0f)
+            return false;
+
+        float nx = Mathf.Clamp01(bestRect.center.x);
+
+        signSide =
+            nx < 0.40f ? Side.Left :
+            nx > 0.60f ? Side.Right :
+            Side.Center;
+
+        float centerFactor = 1f - Mathf.Clamp01(Mathf.Abs(nx - 0.5f) / 0.5f);
+        signStrength01 = Mathf.Clamp01(0.58f + centerFactor * 0.27f + signArea01 * 0.15f);
+        signRect01 = bestRect;
+
+        return true;
+    }
+    private bool TryFindGoogleDoorNearExitText(
+    GoogleLocalizedObjectAnnotation[] objs,
+    Rect signRect01,
+    out Rect bestDoorRect01,
+    out Side bestDoorSide,
+    out float bestDoorStrength01,
+    out float bestDoorArea01)
+    {
+        bestDoorRect01 = new Rect();
+        bestDoorSide = Side.Center;
+        bestDoorStrength01 = 0f;
+        bestDoorArea01 = 0f;
+
+        if (objs == null || objs.Length == 0)
+            return false;
+
+        float doorConfMin = GetMinConfidenceForTarget("usa");
+
+        float bestScore = -999f;
+        Rect chosenDoor = new Rect();
+        float chosenArea01 = 0f;
+
+        foreach (var o in objs)
+        {
+            if (o == null || o.boundingPoly == null) continue;
+            if (o.score < doorConfMin) continue;
+
+            string name = (o.name ?? "").Trim().ToLowerInvariant();
+            if (!LabelMatchesAny(name, "door", "doorway", "entrance", "interior door", "front door"))
+                continue;
+
+            Rect doorRect01 = RectFromGoogle(o.boundingPoly);
+            float area01 = Mathf.Clamp01(doorRect01.width * doorRect01.height);
+
+            float dist = RectCenterDistance(signRect01, doorRect01);
+
+            float verticalBonus = 0f;
+            if (doorRect01.center.y > signRect01.center.y)
+                verticalBonus = 0.12f;
+
+            float overlapX = Mathf.Max(0f,
+                Mathf.Min(signRect01.xMax, doorRect01.xMax) - Mathf.Max(signRect01.xMin, doorRect01.xMin));
+
+            float alignBonus = overlapX > 0.03f ? 0.12f : 0f;
+
+            float score =
+                (o.score * 0.50f) +
+                (area01 * 0.20f) +
+                ((1f - Mathf.Clamp01(dist / 0.85f)) * 0.18f) +
+                verticalBonus +
+                alignBonus;
+
+            if (score > bestScore)
+            {
+                bestScore = score;
+                chosenDoor = doorRect01;
+                chosenArea01 = area01;
+            }
+        }
+
+        if (bestScore < 0f)
+            return false;
+
+        float nx = Mathf.Clamp01(chosenDoor.center.x);
+
+        bestDoorSide =
+            nx < 0.40f ? Side.Left :
+            nx > 0.60f ? Side.Right :
+            Side.Center;
+
+        float center01 = 1f - Mathf.Clamp01(Mathf.Abs(nx - 0.5f) / 0.5f);
+        bestDoorStrength01 = Mathf.Clamp01(0.65f + center01 * 0.35f);
+        bestDoorArea01 = chosenArea01;
+        bestDoorRect01 = chosenDoor;
+
+        return true;
+    }
+    private static Rect RectFromGoogleTextPoly(GoogleBoundingPoly poly, int imgW, int imgH)
+    {
+        if (poly == null)
+            return new Rect(0, 0, 0, 0);
+
+        // Preferăm normalizedVertices dacă există
+        if (poly.normalizedVertices != null && poly.normalizedVertices.Length > 0)
+        {
+            float minX = 1f, minY = 1f, maxX = 0f, maxY = 0f;
+
+            foreach (var v in poly.normalizedVertices)
+            {
+                minX = Mathf.Min(minX, v.x);
+                minY = Mathf.Min(minY, v.y);
+                maxX = Mathf.Max(maxX, v.x);
+                maxY = Mathf.Max(maxY, v.y);
+            }
+
+            return new Rect(
+                Mathf.Clamp01(minX),
+                Mathf.Clamp01(minY),
+                Mathf.Clamp01(maxX - minX),
+                Mathf.Clamp01(maxY - minY)
+            );
+        }
+
+        // Fallback pentru TEXT_DETECTION clasic: vertices în pixeli
+        if (poly.vertices != null && poly.vertices.Length > 0 && imgW > 0 && imgH > 0)
+        {
+            float minX = imgW, minY = imgH, maxX = 0f, maxY = 0f;
+
+            foreach (var v in poly.vertices)
+            {
+                minX = Mathf.Min(minX, v.x);
+                minY = Mathf.Min(minY, v.y);
+                maxX = Mathf.Max(maxX, v.x);
+                maxY = Mathf.Max(maxY, v.y);
+            }
+
+            return new Rect(
+                Mathf.Clamp01(minX / imgW),
+                Mathf.Clamp01(minY / imgH),
+                Mathf.Clamp01((maxX - minX) / imgW),
+                Mathf.Clamp01((maxY - minY) / imgH)
+            );
+        }
+
+        return new Rect(0, 0, 0, 0);
+    }
+    private void TryLoadSecretsConfigIfNeeded()
+    {
+        try
+        {
+            var cfg = Resources.Load<SecretsConfig>("SecretsConfig");
+            if (cfg == null)
+            {
+                Debug.LogWarning("[ObjectFinder] SecretsConfig nu a fost găsit în Resources.");
+                return;
+            }
+
+            // Azure Vision
+            if ((string.IsNullOrWhiteSpace(subscriptionKey) || subscriptionKey.Contains("CHEIA")) &&
+                !string.IsNullOrWhiteSpace(cfg.visionKey))
+            {
+                subscriptionKey = cfg.visionKey;
+            }
+
+            if ((string.IsNullOrWhiteSpace(endpoint) || !endpoint.StartsWith("http", StringComparison.OrdinalIgnoreCase)) &&
+                !string.IsNullOrWhiteSpace(cfg.visionEndpoint))
+            {
+                endpoint = cfg.visionEndpoint;
+            }
+
+            // Google Vision
+            if ((string.IsNullOrWhiteSpace(googleApiKey) || googleApiKey.Contains("PUT_GOOGLE")) &&
+                !string.IsNullOrWhiteSpace(cfg.googleVisionApiKey))
+            {
+                googleApiKey = cfg.googleVisionApiKey;
+            }
+
+            // Translator, dacă nu e legat în Inspector
+            if (translator == null)
+                translator = FindObjectOfType<AzureTranslator>(true);
+
+            Debug.Log("[ObjectFinder] SecretsConfig verificat/injectat pentru ObjectFinder.");
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning("[ObjectFinder] TryLoadSecretsConfigIfNeeded exception: " + e.Message);
+        }
+    }
+    private void SpeakSearchProgressIfNeeded()
+    {
+        if (!speakSearchProgress) return;
+        if (!running) return;
+        if (announcedFound) return;
+        if (searchProgressSpokenOnce) return;
+
+        if (Time.time - startTime < 4.0f)
+            return;
+
+        searchProgressSpokenOnce = true;
+
+        string obj = GetRomanianDisplayName(targetKey, targetRaw);
+        string msg = $"Încă nu văd clar {obj}. Mișcă încet capul stânga-dreapta.";
+
+        uiAnimator?.ShowProcessing(msg);
+
+        if (tts != null && !tts.IsSpeaking())
+            tts.Speak(msg);
+    }
+
+    private void SpeakVisionErrorIfNeeded(string msg)
+    {
+        if (!speakVisionErrors) return;
+        if (!running) return;
+
+        if (Time.time - lastVisionErrorSpeakTime < visionErrorSpeakCooldown)
+            return;
+
+        lastVisionErrorSpeakTime = Time.time;
+
+        uiAnimator?.ShowError(msg);
+
+        if (tts != null && !tts.IsSpeaking())
+            tts.Speak(msg);
+    }
+    private string DirectionText(Side side)
+    {
+        if (side == Side.Left) return "în stânga";
+        if (side == Side.Right) return "în dreapta";
+        return "în față";
+    }
+
+    private void SpeakDirectionGuidanceIfNeeded(HitInfo hit, bool force = false)
+    {
+        if (!speakDirectionGuidance) return;
+        if (!running) return;
+        if (!hit.hasBox) return;
+
+        bool sideChanged = hit.side != lastSpokenDirection;
+
+        if (!force && !sideChanged && Time.time - lastDirectionSpeakTime < directionSpeakCooldown)
+            return;
+
+        lastDirectionSpeakTime = Time.time;
+        lastSpokenDirection = hit.side;
+
+        string msg = $"Obiectul căutat este {DirectionText(hit.side)}. Urmează sunetul.";
+
+        uiAnimator?.ShowSuccess(msg);
+
+        if (tts != null && !tts.IsSpeaking())
+            tts.Speak(msg);
+    }
+    private string GetRomanianDisplayName(string key, string fallback)
+    {
+        key = NormalizeRo(key ?? "");
+        fallback = fallback ?? "";
+
+        switch (key)
+        {
+            case "scaun": return "scaun";
+            case "masa": return "masă";
+            case "masa libera": return "masă liberă";
+            case "dulap": return "dulap";
+            case "fereastra": return "fereastră";
+            case "usa": return "ușă";
+            case "cos gunoi": return "coș de gunoi";
+            case "semn iesire": return "semn de ieșire";
+            case "pat": return "pat";
+            case "canapea": return "canapea";
+            case "telefon": return "telefon";
+            case "laptop": return "laptop";
+            case "televizor": return "televizor";
+            case "sticla": return "sticlă";
+            case "cana": return "cană";
+            case "ochelari": return "ochelari";
+        }
+
+        if (!string.IsNullOrWhiteSpace(fallback))
+            return fallback;
+
+        return key;
+    }
+    private bool IsNearOrOverlapsTarget(Rect targetRect01, Rect otherRect01, float overlapThreshold, bool isPerson)
+    {
+        float overlap = OverlapOnTarget(targetRect01, otherRect01);
+        if (overlap >= overlapThreshold)
+            return true;
+
+        Rect expanded = ExpandRect01(
+            targetRect01,
+            isPerson ? 0.18f : 0.10f,
+            isPerson ? 0.18f : 0.10f
+        );
+
+        if (expanded.Contains(otherRect01.center))
+            return true;
+
+        float dx = Mathf.Abs(targetRect01.center.x - otherRect01.center.x);
+        float dy = Mathf.Abs(targetRect01.center.y - otherRect01.center.y);
+
+        if (isPerson)
+            return dx < 0.42f && dy < 0.48f;
+
+        return dx < 0.25f && dy < 0.30f;
+    }
+
+    private Rect ExpandRect01(Rect r, float xPad, float yPad)
+    {
+        float xMin = Mathf.Clamp01(r.xMin - xPad);
+        float yMin = Mathf.Clamp01(r.yMin - yPad);
+        float xMax = Mathf.Clamp01(r.xMax + xPad);
+        float yMax = Mathf.Clamp01(r.yMax + yPad);
+
+        return Rect.MinMaxRect(xMin, yMin, xMax, yMax);
+    }
+    private bool IsPersonLabel(string label)
+    {
+        if (string.IsNullOrWhiteSpace(label)) return false;
+
+        label = label.Trim().ToLowerInvariant();
+
+        return label.Contains("person")
+            || label.Contains("human")
+            || label.Contains("man")
+            || label.Contains("woman")
+            || label.Contains("child");
+    }
+
+    private bool IsSeatOrNearbyFurnitureLabel(string label)
+    {
+        if (string.IsNullOrWhiteSpace(label)) return false;
+
+        label = label.Trim().ToLowerInvariant();
+
+        // Acestea pot fi lângă scaun și NU trebuie să facă scaunul ocupat.
+        return label == "chair"
+            || label.Contains("chair")
+            || label.Contains("seat")
+            || label.Contains("table")
+            || label.Contains("desk")
+            || label.Contains("dining table")
+            || label.Contains("coffee table")
+            || label.Contains("furniture");
+    }
+
+    private Rect GetSeatZone(Rect chairRect01)
+    {
+        // Zona reală de interes: partea centrală a scaunului, unde ar sta o persoană/obiect.
+        // Nu folosim tot bounding box-ul scaunului, ca să nu confundăm biroul de lângă el.
+        float xPad = chairRect01.width * 0.12f;
+        float topCut = chairRect01.height * 0.25f;
+        float bottomCut = chairRect01.height * 0.05f;
+
+        float xMin = Mathf.Clamp01(chairRect01.xMin + xPad);
+        float xMax = Mathf.Clamp01(chairRect01.xMax - xPad);
+        float yMin = Mathf.Clamp01(chairRect01.yMin + topCut);
+        float yMax = Mathf.Clamp01(chairRect01.yMax - bottomCut);
+
+        if (xMax <= xMin || yMax <= yMin)
+            return chairRect01;
+
+        return Rect.MinMaxRect(xMin, yMin, xMax, yMax);
+    }
+
+    private bool ObjectActuallyOnSeat(Rect chairRect01, Rect objectRect01)
+    {
+        Rect seatZone = GetSeatZone(chairRect01);
+        Rect chairCore = GetChairCoreZone(chairRect01);
+
+        // 1) Dacă centrul obiectului este în scaun, este ocupat.
+        if (seatZone.Contains(objectRect01.center) || chairCore.Contains(objectRect01.center))
+            return true;
+
+        // 2) Verificăm puncte utile ale obiectului.
+        Vector2 bottomCenter = new Vector2(objectRect01.center.x, objectRect01.yMax);
+        Vector2 topCenter = new Vector2(objectRect01.center.x, objectRect01.yMin);
+
+        if (seatZone.Contains(bottomCenter) || seatZone.Contains(topCenter))
+            return true;
+
+        if (chairCore.Contains(bottomCenter) || chairCore.Contains(topCenter))
+            return true;
+
+        // 3) IMPORTANT pentru obiecte mici:
+        // nu raportăm doar la aria scaunului, ci și la aria obiectului.
+        float objectInsideSeat = OverlapOfObjectInsideTarget(seatZone, objectRect01);
+        float objectInsideChair = OverlapOfObjectInsideTarget(chairCore, objectRect01);
+
+        if (objectInsideSeat >= 0.20f)
+            return true;
+
+        if (objectInsideChair >= 0.30f)
+            return true;
+
+        // 4) Pentru obiecte mari, verificăm și cât ocupă din zona scaunului.
+        float seatCovered = OverlapOnTarget(seatZone, objectRect01);
+        if (seatCovered >= 0.04f)
+            return true;
+
+        return false;
+    }
+
+    private bool PersonActuallyOnChair(Rect chairRect01, Rect personRect01)
+    {
+        // Pentru persoană cerem suprapunere reală cu scaunul.
+        // Nu e suficient să fie doar aproape, pentru că poate sta lângă birou.
+        float overlapOnChair = OverlapOnTarget(chairRect01, personRect01);
+
+        if (overlapOnChair >= 0.10f)
+            return true;
+
+        Rect seatZone = GetSeatZone(chairRect01);
+
+        // Dacă centrul persoanei cade în zona scaunului, probabil este așezată.
+        if (seatZone.Contains(personRect01.center))
+            return true;
+
+        // Dacă partea de jos a persoanei este peste zona scaunului, probabil este așezată.
+        Vector2 lowerPoint = new Vector2(personRect01.center.x, personRect01.yMax);
+        if (seatZone.Contains(lowerPoint))
+            return true;
+
+        return false;
+    }
+    private Rect GetChairCoreZone(Rect chairRect01)
+    {
+        // Zonă mai largă decât șezutul strict.
+        // Ajută pentru obiecte mici detectate puțin deplasat pe scaun.
+        float xPad = chairRect01.width * 0.04f;
+        float yPad = chairRect01.height * 0.08f;
+
+        float xMin = Mathf.Clamp01(chairRect01.xMin + xPad);
+        float xMax = Mathf.Clamp01(chairRect01.xMax - xPad);
+        float yMin = Mathf.Clamp01(chairRect01.yMin + yPad);
+        float yMax = Mathf.Clamp01(chairRect01.yMax - yPad);
+
+        if (xMax <= xMin || yMax <= yMin)
+            return chairRect01;
+
+        return Rect.MinMaxRect(xMin, yMin, xMax, yMax);
+    }
+
+    private float OverlapOfObjectInsideTarget(Rect targetRect01, Rect objectRect01)
+    {
+        float xMin = Mathf.Max(targetRect01.xMin, objectRect01.xMin);
+        float yMin = Mathf.Max(targetRect01.yMin, objectRect01.yMin);
+        float xMax = Mathf.Min(targetRect01.xMax, objectRect01.xMax);
+        float yMax = Mathf.Min(targetRect01.yMax, objectRect01.yMax);
+
+        float w = Mathf.Max(0f, xMax - xMin);
+        float h = Mathf.Max(0f, yMax - yMin);
+
+        float inter = w * h;
+        float objectArea = Mathf.Max(0.0001f, objectRect01.width * objectRect01.height);
+
+        return inter / objectArea;
+    }
+    private bool IsGenericPhysicalObjectLabel(string label)
+    {
+        if (string.IsNullOrWhiteSpace(label)) return false;
+
+        label = label.Trim().ToLowerInvariant();
+
+        // Lucruri pe care NU vrem să le tratăm ca obiecte puse pe scaun.
+        if (label.Contains("chair") ||
+            label.Contains("seat") ||
+            label.Contains("table") ||
+            label.Contains("desk") ||
+            label.Contains("furniture") ||
+            label.Contains("wall") ||
+            label.Contains("floor") ||
+            label.Contains("ceiling") ||
+            label.Contains("door") ||
+            label.Contains("window"))
+        {
+            return false;
+        }
+
+        // Dacă Vision a localizat un obiect cu bounding box și nu este mobilier/fundal,
+        // îl tratăm ca potențial obiect fizic pe scaun.
+        return true;
+    }
+    private enum RoObjectGrammar
+    {
+        MasculineSingular,
+        FeminineSingular,
+        MasculinePlural,
+        FemininePlural
+    }
+
+    private RoObjectGrammar GetRomanianGrammar(string key)
+    {
+        key = NormalizeRo(key ?? "");
+
+        switch (key)
+        {
+            // Feminin singular: o găsesc
+            case "sticla":
+            case "cana":
+            case "usa":
+            case "fereastra":
+            case "masa":
+            case "masa libera":
+            case "canapea":
+                return RoObjectGrammar.FeminineSingular;
+
+            // Plural masculin: îi găsesc
+            case "ochelari":
+                return RoObjectGrammar.MasculinePlural;
+
+            // Masculin singular: îl găsesc
+            case "scaun":
+            case "pat":
+            case "dulap":
+            case "telefon":
+            case "laptop":
+            case "televizor":
+            case "cos gunoi":
+            case "semn iesire":
+            default:
+                return RoObjectGrammar.MasculineSingular;
+        }
+    }
+
+    private string FindObjectPronounAccusative(string key)
+    {
+        switch (GetRomanianGrammar(key))
+        {
+            case RoObjectGrammar.FeminineSingular:
+                return "o";
+
+            case RoObjectGrammar.MasculinePlural:
+                return "îi";
+
+            case RoObjectGrammar.FemininePlural:
+                return "le";
+
+            case RoObjectGrammar.MasculineSingular:
+            default:
+                return "îl";
+        }
+    }
+
+    private string WhenIFindObjectText(string key)
+    {
+        return $"Când {FindObjectPronounAccusative(key)} găsesc";
+    }
+
+    private string PossibleDetectionText(string key)
+    {
+        return $"{FirstUpper(FindObjectPronounAccusative(key))} detectez posibil în zonă";
+    }
+
+    private string FirstUpper(string s)
+    {
+        if (string.IsNullOrWhiteSpace(s))
+            return s;
+
+        if (s.Length == 1)
+            return s.ToUpperInvariant();
+
+        return char.ToUpperInvariant(s[0]) + s.Substring(1);
+    }
+
+
+
+
+
+
 }
